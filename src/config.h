@@ -122,6 +122,7 @@ namespace config {
     int hdr_prep;
     bool variable_refresh_rate;  // Allow video stream framerate to match render framerate for VRR support
     int minimum_fps_target;  // Minimum FPS target (0 = auto, 1-1000 = minimum FPS to maintain)
+    bool fixed_frame_cadence;  // Emit on a fixed frame-interval grid (repeat the last frame when the screen is static) instead of letting the wait timeout and the encode time add up
     bool input_activity_boost;  // Temporarily raise encoding cadence after local input while VRR is active
     int input_activity_boost_fps;  // Minimum FPS floor to maintain during the input activity boost window
     int input_activity_boost_window_ms;  // Duration of the input activity boost window in milliseconds
@@ -226,6 +227,16 @@ namespace config {
     bool amf_draw_mouse_cursor;
     bool clipboard_sync;  ///< Bidirectional clipboard sync (text + single image). On by default; effective only when the user-session GUI agent is alive. Set to false to force-disable.
     bool client_gamepad_override;  ///< Honor the client-declared controller type carried on the /launch query (Sunshine extension). On by default; set false to keep host-side selection authoritative.
+
+    // --- S Pen / Wintab tuning (SuperSun) -----------------------------------
+    // Both used to be environment-variable only. They are real config keys now so
+    // that the "drawing mode" preset can switch them on in one click. The legacy
+    // SUNSHINE_PEN_PRESSURE_GAMMA / SUNSHINE_PEN_HOVER_PRESSURE environment
+    // variables still take precedence when present (handy for quick A/B tuning).
+    /** Pressure curve applied to the Ink path. 1.0 = linear; <1.0 lifts light strokes. */
+    float pen_pressure_gamma = 0.7f;
+    /** Pressure band reported while the pen hovers, 0..64. 0 = hovering never draws. */
+    int pen_hover_pressure = 0;
   };
 
   namespace flag {

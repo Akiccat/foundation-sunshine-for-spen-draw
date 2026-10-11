@@ -4,6 +4,8 @@
  */
 #include <algorithm>
 #include <chrono>
+#include <cmath>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <functional>
@@ -500,6 +502,7 @@ namespace config {
     (int) display_device::parsed_config_t::hdr_prep_e::automatic,  // hdr_prep
     false,  // variable_refresh_rate
     0,  // minimum_fps_target (0 = auto, about half the stream FPS)
+    false,  // fixed_frame_cadence (default: off -- only an explicit opt-in keeps encoding on a fixed grid)
     true,  // input_activity_boost
     60,  // input_activity_boost_fps
     150,  // input_activity_boost_window_ms
@@ -602,6 +605,9 @@ namespace config {
     false, // amf_draw_mouse_cursor
     true,  // clipboard_sync (default on; effective only when the user-session GUI agent is alive and forwards data)
     true,  // client_gamepad_override (client-declared type wins; no official client sends it today)
+
+    0.7f,  // pen_pressure_gamma (1.0 = linear; below 1.0 lifts light strokes)
+    0,  // pen_hover_pressure (0..64; 0 = hovering must never draw)
   };
 
   sunshine_t sunshine {
@@ -1375,6 +1381,7 @@ namespace config {
     int_f(vars, "max_bitrate", video.max_bitrate);
     bool_f(vars, "variable_refresh_rate", video.variable_refresh_rate);
     int_between_f(vars, "minimum_fps_target", video.minimum_fps_target, { 0, 1000 });
+    bool_f(vars, "fixed_frame_cadence", video.fixed_frame_cadence);
     bool_f(vars, "input_activity_boost", video.input_activity_boost);
     int_between_f(vars, "input_activity_boost_fps", video.input_activity_boost_fps, { 0, 1000 });
     int_between_f(vars, "input_activity_boost_window_ms", video.input_activity_boost_window_ms, { 0, 5000 });
@@ -1587,6 +1594,23 @@ namespace config {
     bool_f(vars, "virtual_mouse", input.virtual_mouse);
     bool_f(vars, "amf_draw_mouse_cursor", input.amf_draw_mouse_cursor);
     bool_f(vars, "clipboard_sync", input.clipboard_sync);
+
+    // S Pen tuning. Kept as plain keys so the drawing-mode preset can drive them.
+    // SUNSHINE_PEN_* environment variables still win at runtime (see input.cpp).
+    {
+      auto it = vars.find("pen_pressure_gamma");
+      if (it != vars.end()) {
+        char *end = nullptr;
+        auto parsed = std::strtof(it->second.c_str(), &end);
+        if (end != it->second.c_str() && std::isfinite(parsed) && parsed > 0.0f && parsed <= 4.0f) {
+          input.pen_pressure_gamma = parsed;
+        }
+        else {
+          BOOST_LOG(warning) << "Ignoring invalid pen_pressure_gamma: ["sv << it->second << "]";
+        }
+      }
+    }
+    int_between_f(vars, "pen_hover_pressure", input.pen_hover_pressure, { 0, 64 });
 
     bool_f(vars, "notify_pre_releases", sunshine.notify_pre_releases);
 

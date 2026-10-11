@@ -219,6 +219,17 @@ main(int argc, char *argv[]) {
 
   // Set locale to UTF-8 instead of C locale
   setlocale(LC_ALL, ".UTF-8");
+
+  // ...but that only controls how we *produce* text. A console window still
+  // decodes the bytes it receives using its own code page, which on a zh-CN
+  // system is CP936 (GBK) -- so every Chinese log line shows up as mojibake
+  // ("忽略任何错误" -> "蹇界暐浠讳綍閿欒"). Tell the console to decode UTF-8.
+  // sunshine.exe is usually started via Start-Process, which gets a brand new
+  // console, so this has to happen in-process; `chcp 65001` in a launcher
+  // script would not affect the console this process ends up owning.
+  // SetConsoleCP covers the input direction, for anything typed at the prompt.
+  SetConsoleOutputCP(CP_UTF8);
+  SetConsoleCP(CP_UTF8);
 #endif
 
 #pragma GCC diagnostic push

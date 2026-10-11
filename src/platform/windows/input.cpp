@@ -9,6 +9,7 @@
 
 #include <array>
 #include <cmath>
+#include <cstdlib>
 #include <limits>
 #include <mutex>
 #include <thread>
@@ -16,6 +17,7 @@
 #include <ViGEm/Client.h>
 
 #include "dsu_server.h"
+#include "superwintab_state.h"
 #include "ds5/ds5_sidecar_client.h"
 #include "src/ds5/config.h"
 #include "keylayout.h"
@@ -1216,6 +1218,21 @@ namespace platf {
   /**
    * @brief Repeats the current pen state to avoid the interactions timing out.
    * @param raw The raw client-specific input context.
+   *
+   * SuperSun: this callback re-arms itself with task_pool.delay() instead of
+   * pushDelayed()-ing a brand new task.
+   *
+   * Upstream created a fresh task every time, which races with pen_update():
+   * the incoming-event path cancels penRepeatTask and pushes a new one, but if
+   * this callback happened to be running at that moment the cancel found
+   * nothing to remove, and both the running callback and the new event would
+   * then each push their own task into the queue. From then on two (or more)
+   * independent self-rearming repeat chains injected into the same penInfo at
+   * 50ms intervals with slightly different coordinates, which is what produced
+   * the periodic pen stutter / coordinate jumping.
+   *
+   * delay() mutates the existing entry in the timer queue and preserves the
+   * original task_id, so there is exactly one live repeat chain per client.
    */
   void
   repeat_pen(client_input_raw_t *raw) {
@@ -1224,7 +1241,12 @@ namespace platf {
       BOOST_LOG(warning) << "Failed to refresh virtual pen input: "sv << err;
     }
 
-    raw->penRepeatTask = task_pool.pushDelayed(repeat_pen, ISPI_REPEAT_INTERVAL, raw).task_id;
+    // Re-arm the same task. We intentionally do not reassign penRepeatTask:
+    // its id stays valid, and pen_update() may have already re-armed or
+    // cancelled it while we were injecting.
+    if (raw->penRepeatTask) {
+      task_pool.delay(raw->penRepeatTask, ISPI_REPEAT_INTERVAL);
+    }
   }
 
   /**
@@ -1261,6 +1283,220 @@ namespace platf {
 
   // These are edge-triggered pointer state flags that should always be cleared next frame
   constexpr auto EDGE_TRIGGERED_POINTER_FLAGS = POINTER_FLAG_DOWN | POINTER_FLAG_UP | POINTER_FLAG_CANCELED | POINTER_FLAG_UPDATE;
+
+  // SuperSun pen tuning.
+  //
+  // PRESSURE_GAMMA shapes the pressure response for contact strokes. 1.0 is the
+  // upstream linear mapping; values below 1.0 lift the low-pressure range so
+  // light strokes get more of the 0..1024 steps, which feels closer to a real
+  // tablet. Set to 1.0f to restore exactly the upstream behaviour.
+  //
+  // Why a curve at all: the Win32 Pointer channel is hard-limited to 1024
+  // pressure steps (verified empirically - injected values above 1024 all come
+  // back as exactly 1024). That is a *resolution* limit, not a *linearity*
+  // limit, so the only available lever for "light strokes feel wrong" is how
+  // those 1024 steps are distributed across the 0..1 input range. A gamma
+  // below 1.0 spends more of the steps where the hand actually is.
+  //
+  // Configurable through sunshine.conf ("pen_pressure_gamma"; 0.7 default) and
+  // overridable per-run for A/B tuning without touching the file:
+  //   SUNSHINE_PEN_PRESSURE_GAMMA=0.55 sunshine.exe
+  constexpr float PRESSURE_GAMMA_DEFAULT = 0.7f;
+
+  float
+  pen_pressure_gamma() {
+    static const float cached = [] {
+      const char *env = std::getenv("SUNSHINE_PEN_PRESSURE_GAMMA");
+      if (!env || !*env) {
+        return config::input.pen_pressure_gamma > 0.0f
+                 ? config::input.pen_pressure_gamma
+                 : PRESSURE_GAMMA_DEFAULT;
+      }
+
+      char *end = nullptr;
+      auto parsed = std::strtof(env, &end);
+      if (end == env || !std::isfinite(parsed) || parsed <= 0.0f || parsed > 4.0f) {
+        BOOST_LOG(warning) << "Ignoring invalid SUNSHINE_PEN_PRESSURE_GAMMA=\""sv << env
+                           << "\"; using "sv << PRESSURE_GAMMA_DEFAULT;
+        return PRESSURE_GAMMA_DEFAULT;
+      }
+
+      BOOST_LOG(info) << "SuperSun: pen pressure gamma set to "sv << parsed
+                      << " via SUNSHINE_PEN_PRESSURE_GAMMA"sv;
+      return parsed;
+    }();
+    return cached;
+  }
+
+  // Upper end of the pressure scale we hand to the Windows pen stack.
+  //
+  // Upstream hardcodes 1024 here. winuser.h declares POINTER_PEN_INFO.pressure
+  // as a bare UINT32 with no documented range, and nothing in the type stops us
+  // from sending more, so whether 1024 is a real ceiling is an empirical
+  // question about what the OS does with an out-of-range value: clamp it,
+  // forward it, or rescale against an assumed maximum.
+  //
+  // We expose it as an environment variable so the probe in
+  // tools/pen_pressure_probe.py can sweep it without a recompile. Default stays
+  // at 1024, i.e. exactly the upstream behaviour.
+  //
+  //   SUNSHINE_PEN_PRESSURE_MAX=4096 sunshine.exe
+  //
+  // Note this only affects the *contact* path. Values are also clamped to the
+  // normalized 0..1 range before scaling, so the protocol itself never needs to
+  // change: the client already sends full-precision floats.
+  UINT32
+  pen_pressure_max() {
+    static const UINT32 cached = [] {
+      const char *env = std::getenv("SUNSHINE_PEN_PRESSURE_MAX");
+      if (!env || !*env) {
+        return (UINT32) 1024;
+      }
+
+      char *end = nullptr;
+      auto parsed = std::strtoul(env, &end, 10);
+      if (end == env || parsed == 0 || parsed > 0xFFFFFFFFUL) {
+        BOOST_LOG(warning) << "Ignoring invalid SUNSHINE_PEN_PRESSURE_MAX=\""sv << env
+                           << "\"; using 1024"sv;
+        return (UINT32) 1024;
+      }
+
+      BOOST_LOG(info) << "SuperSun: pen pressure scale set to "sv << parsed
+                      << " via SUNSHINE_PEN_PRESSURE_MAX"sv;
+      return (UINT32) parsed;
+    }();
+    return cached;
+  }
+
+  // Pressure reported while the pen is hovering in range (no contact).
+  //
+  // Earlier SuperSun builds always reported a small non-zero band (1..8) here,
+  // the idea being that apps could then tell "hovering" apart from "lifted".
+  // It backfires in Clip Studio Paint: once the brush's pressure dynamics are
+  // switched off, a non-zero pressure becomes the only remaining "pen is down"
+  // signal (POINTER_FLAG_INCONTACT is cleared during hover), so CSP happily
+  // draws while the pen is in the air. With dynamics left on it only looked
+  // harmless because 6/1024 renders as nothing.
+  //
+  // Windows' own convention for hover is pressure == 0, with the pen's presence
+  // carried by POINTER_FLAG_INRANGE alone, so 0 is the correct default.
+  //
+  //   SUNSHINE_PEN_HOVER_PRESSURE=8      restore the old 1..8-style band
+  //   SUNSHINE_PEN_HOVER_PRESSURE=0      (default) plain Windows semantics
+  constexpr UINT32 PRESSURE_HOVER_DEFAULT = 0;
+  constexpr UINT32 PRESSURE_HOVER_LIMIT = 64;
+
+  UINT32
+  pen_hover_pressure() {
+    static const UINT32 cached = [] {
+      const char *env = std::getenv("SUNSHINE_PEN_HOVER_PRESSURE");
+      if (!env || !*env) {
+        const auto from_conf = config::input.pen_hover_pressure;
+        if (from_conf < 0) {
+          return PRESSURE_HOVER_DEFAULT;
+        }
+        return (UINT32) std::min(from_conf, (int) PRESSURE_HOVER_LIMIT);
+      }
+
+      char *end = nullptr;
+      auto parsed = std::strtoul(env, &end, 10);
+      if (end == env || parsed > PRESSURE_HOVER_LIMIT) {
+        BOOST_LOG(warning) << "Ignoring invalid SUNSHINE_PEN_HOVER_PRESSURE=\""sv << env
+                           << "\"; using "sv << PRESSURE_HOVER_DEFAULT;
+        return PRESSURE_HOVER_DEFAULT;
+      }
+
+      BOOST_LOG(info) << "SuperSun: pen hover pressure band set to "sv << parsed
+                      << " via SUNSHINE_PEN_HOVER_PRESSURE"sv;
+      return (UINT32) parsed;
+    }();
+    return cached;
+  }
+
+  // --------------------------------------------------------------------------
+  // SuperSun Wintab pressure channel
+  //
+  // InjectSyntheticPointerInput() clamps pen pressure to 1024 steps no matter
+  // what we hand it. Rather than fight that, we also publish the pen state into
+  // a shared-memory section at full float precision. Our own Wintab32.dll
+  // (dropped next to a drawing app's exe, which Windows searches before
+  // System32) reads it there and hands WinTab PACKETs to the app with a 4096
+  // pressure axis -- four times what the Ink path can express.
+  // --------------------------------------------------------------------------
+  HANDLE g_sw_map = nullptr;
+  superwintab_state_t *g_sw_state = nullptr;
+  CRITICAL_SECTION g_sw_lock;
+
+  void
+  superwintab_publish(const pen_input_t &pen, const touch_port_t &touch_port, const POINTER_PEN_INFO &penInfo) {
+    if (!g_sw_state) {
+      g_sw_map = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                    SUPERWINTAB_MAP_SIZE, SUPERWINTAB_MAP_NAME);
+      if (!g_sw_map) {
+        BOOST_LOG(warning) << "SuperSun: 无法创建 Wintab 压感通道 (err="sv << GetLastError() << ")"sv;
+        return;
+      }
+
+      void *view = MapViewOfFile(g_sw_map, FILE_MAP_WRITE, 0, 0, SUPERWINTAB_MAP_SIZE);
+      if (!view) {
+        BOOST_LOG(warning) << "SuperSun: 无法映射 Wintab 压感通道 (err="sv << GetLastError() << ")"sv;
+        CloseHandle(g_sw_map);
+        g_sw_map = nullptr;
+        return;
+      }
+
+      InitializeCriticalSection(&g_sw_lock);
+      g_sw_state = (superwintab_state_t *) view;
+      g_sw_state->magic = SUPERWINTAB_MAGIC;
+      g_sw_state->version = SUPERWINTAB_VERSION;
+      g_sw_state->seq = 0;
+      g_sw_state->sample_id = 0;
+      BOOST_LOG(info) << "SuperSun: Wintab 压感通道就绪 ["sv << SUPERWINTAB_MAP_NAME
+                      << "]，量程 0.."sv << SUPERWINTAB_PRESSURE_MAX;
+    }
+
+    EnterCriticalSection(&g_sw_lock);
+
+    auto *s = g_sw_state;
+    // Seqlock: odd while storing, even when stable, so a reader in the drawing
+    // app can detect a torn sample without taking a lock.
+    const std::uint32_t busy = s->seq + 1;
+    s->seq = busy;
+
+    LARGE_INTEGER qpc;
+    QueryPerformanceCounter(&qpc);
+    LARGE_INTEGER freq;
+    QueryPerformanceFrequency(&freq);
+    const auto us = freq.QuadPart ? (qpc.QuadPart * 1000000LL) / freq.QuadPart : 0LL;
+    s->timestamp_us = (std::uint64_t) us;
+    s->sample_id = s->sample_id + 1;
+
+    std::uint32_t flags = 0;
+    if (penInfo.pointerInfo.pointerFlags & POINTER_FLAG_INRANGE) flags |= SWPEN_FLAG_IN_RANGE;
+    if (penInfo.pointerInfo.pointerFlags & POINTER_FLAG_INCONTACT) flags |= SWPEN_FLAG_IN_CONTACT;
+    if (pen.toolType == LI_TOOL_TYPE_ERASER) flags |= SWPEN_FLAG_ERASER;
+    if (pen.penButtons) flags |= SWPEN_FLAG_BARREL;
+    if (pen.rotation != LI_ROT_UNKNOWN) flags |= SWPEN_FLAG_ROT_VALID;
+    if (pen.tilt != LI_TILT_UNKNOWN && pen.rotation != LI_ROT_UNKNOWN) flags |= SWPEN_FLAG_TILT_VALID;
+    s->flags = flags;
+
+    s->buttons = (flags & SWPEN_FLAG_IN_CONTACT) ? 0x1u : 0x0u;
+    s->x = pen.x;
+    s->y = pen.y;
+    // Raw, ungammaled: a WinTab app applies its own pressure curve, so it wants
+    // a linear input. PRESSURE_GAMMA only exists to make the clamped Ink path
+    // feel right.
+    s->pressure = (flags & SWPEN_FLAG_IN_CONTACT) ? std::clamp(pen.pressureOrDistance, 0.0f, 1.0f) : 0.0f;
+    s->tilt_x = (float) penInfo.tiltX;
+    s->tilt_y = (float) penInfo.tiltY;
+    s->rotation = pen.rotation != LI_ROT_UNKNOWN ? (float) pen.rotation : 0.0f;
+    s->screen_w = touch_port.width;
+    s->screen_h = touch_port.height;
+
+    s->seq = busy + 1;
+
+    LeaveCriticalSection(&g_sw_lock);
+  }
 
   constexpr ULONG HIMETRIC_PER_MM = 100;
   constexpr ULONG DEFAULT_TOUCHPAD_WIDTH_HIMETRIC = 92 * HIMETRIC_PER_MM;
@@ -1838,8 +2074,18 @@ namespace platf {
       }
     }
 
-    // Cancel pen repeat callbacks
-    if (raw->penRepeatTask) {
+    // Cancel pen repeat callbacks. We do this *before* injecting so a repeat
+    // that is already queued cannot land after the up/cancel event and revive a
+    // finished stroke. When we are going to keep the pen active we re-arm at
+    // the bottom of this function instead of cancelling here.
+    //
+    // Note: this early check has to look at the *incoming* event type rather
+    // than pointerFlags, because populate_common_pointer_info() has not run yet
+    // and pointerFlags still holds the previous event's state.
+    const bool pen_ending = pen.eventType == LI_TOUCH_EVENT_UP ||
+                            pen.eventType == LI_TOUCH_EVENT_CANCEL ||
+                            pen.eventType == LI_TOUCH_EVENT_CANCEL_ALL;
+    if (raw->penRepeatTask && pen_ending) {
       task_pool.cancel(raw->penRepeatTask);
       raw->penRepeatTask = nullptr;
     }
@@ -1876,12 +2122,65 @@ namespace platf {
 
     penInfo.penMask = PEN_MASK_NONE;
 
-    // Windows doesn't support hover distance, so only pass pressure/distance when the pointer is in contact
-    if ((penInfo.pointerInfo.pointerFlags & POINTER_FLAG_INCONTACT) && pen.pressureOrDistance != 0.0f) {
-      penInfo.penMask |= PEN_MASK_PRESSURE;
+    // SuperSun: pressure handling for both contact and hover.
+    //
+    // Windows normalises POINTER_PEN_INFO.pressure to 0..1024 and treats 0 as
+    // "no pressure". That makes hover ambiguous: an app cannot tell a hovering
+    // pen from a lifted one, so some apps (OneNote, Krita, Photoshop) misread a
+    // hover move as a zero-pressure stroke.
+    //
+    // The moonlight protocol already carries hover: pen_input_t.pressureOrDistance
+    // is documented as "Distance for hover and pressure for contact". Upstream
+    // Sunshine throws that information away; we forward it as a small non-zero
+    // pressure band (PRESSURE_HOVER_MIN..PRESSURE_HOVER_MAX) so the app can see
+    // the pen is in range without treating it as contact.
+    if (penInfo.pointerInfo.pointerFlags & POINTER_FLAG_INCONTACT) {
+      if (pen.pressureOrDistance != 0.0f) {
+        penInfo.penMask |= PEN_MASK_PRESSURE;
 
-      // Convert the 0.0f..1.0f float to the 0..1024 range that Windows uses
-      penInfo.pressure = (UINT32) (pen.pressureOrDistance * 1024);
+        // Convert the 0.0f..1.0f float to the integer scale the Windows pen
+        // stack expects. The scale defaults to 1024 but can be raised with
+        // SUNSHINE_PEN_PRESSURE_MAX (see pen_pressure_max()).
+        //
+        // 1024 is a resolution limit, not a linearity limit, so the optional
+        // gamma curve below is what actually buys back light-touch control.
+        auto normalized = std::clamp(pen.pressureOrDistance, 0.0f, 1.0f);
+        const auto gamma = pen_pressure_gamma();
+        if (gamma != 1.0f) {
+          normalized = std::pow(normalized, gamma);
+        }
+        const auto scale = (float) pen_pressure_max();
+        // Round rather than truncate: at 1024 steps a plain cast silently
+        // discards up to a full step of the low-pressure range.
+        penInfo.pressure = (UINT32) std::lround(normalized * scale);
+      }
+      else {
+        // The default pen pressure is 0
+        penInfo.pressure = 0;
+      }
+    }
+    else if ((penInfo.pointerInfo.pointerFlags & POINTER_FLAG_INRANGE) &&
+             pen.eventType == LI_TOUCH_EVENT_HOVER) {
+      // Hovering in range: the pen is present (POINTER_FLAG_INRANGE) but its
+      // pressure is Windows' documented hover value of 0.
+      //
+      // The one thing we do *get* here is the hover distance -- the protocol
+      // packs the distance into pressureOrDistance for hover events, verified
+      // against real Galaxy Tab S7+ traffic (0.098..0.278 while hovering).
+      // Only map it onto a pressure band if that was explicitly asked for; see
+      // pen_hover_pressure() for why injecting it unconditionally breaks CSP.
+      penInfo.penMask |= PEN_MASK_PRESSURE;
+      const auto hover_band = pen_hover_pressure();
+      if (hover_band > 0 && pen.pressureOrDistance != 0.0f) {
+        // pressureOrDistance is 0.0 at the surface and 1.0 at the edge of the
+        // hover range, so invert it to make "closer to the screen" mean "more
+        // pressure".
+        auto proximity = std::clamp(1.0f - pen.pressureOrDistance, 0.0f, 1.0f);
+        penInfo.pressure = (UINT32) std::lround(proximity * hover_band);
+      }
+      else {
+        penInfo.pressure = 0;
+      }
     }
     else {
       // The default pen pressure is 0
@@ -1913,6 +2212,16 @@ namespace platf {
       penInfo.tiltY = 0;
     }
 
+    // SuperSun: publish the pen state for our own Wintab32.dll before using the
+    // pointer stack. The pointer stack clamps pressure to 1024 steps no matter
+    // what we hand it, so anything that needs the real range (4096 from the S
+    // Pen) has to read it from here instead.
+    //
+    // Note this is the RAW pressure, without PRESSURE_GAMMA. The gamma curve
+    // exists to make the 1024-step Ink path feel right; a WinTab app has its
+    // own pressure response curve and expects a linear input.
+    superwintab_publish(pen, touch_port, penInfo);
+
     if (!inject_synthetic_pointer_input(raw->global, raw->pen, &raw->penInfo, 1)) {
       auto err = GetLastError();
       BOOST_LOG(warning) << "Failed to inject virtual pen input: "sv << err;
@@ -1922,9 +2231,22 @@ namespace platf {
     // Clear pointer flags that should only remain set for one frame
     penInfo.pointerInfo.pointerFlags &= ~EDGE_TRIGGERED_POINTER_FLAGS;
 
-    // If we still have an active pen interaction, refresh the pen state periodically
+    // If we still have an active pen interaction, refresh the pen state periodically.
+    //
+    // SuperSun: re-arm the existing task when we already have one. Pushing a
+    // new task here on every event is what let the old repeat chain escape
+    // cancellation and run concurrently with the new one.
+    //
+    // This is evaluated *after* populate_common_pointer_info() and after the
+    // edge-triggered flags were cleared, so UP/CANCEL leave POINTER_FLAG_NONE
+    // and correctly stop the repeat chain.
     if (penInfo.pointerInfo.pointerFlags != POINTER_FLAG_NONE) {
-      raw->penRepeatTask = task_pool.pushDelayed(repeat_pen, ISPI_REPEAT_INTERVAL, raw).task_id;
+      if (raw->penRepeatTask) {
+        task_pool.delay(raw->penRepeatTask, ISPI_REPEAT_INTERVAL);
+      }
+      else {
+        raw->penRepeatTask = task_pool.pushDelayed(repeat_pen, ISPI_REPEAT_INTERVAL, raw).task_id;
+      }
     }
   }
 

@@ -110,3 +110,8 @@ build.sh
 tools/sunshine-ds5-sidecar/bin/
 tools/sunshine-ds5-sidecar/obj/
 .claude/
+
+# 排查问题时留下的旧构建树（只在仓库根目录）。这些是完整编译产物，
+# 动辄数 MB，绝不能进版本库；保留它们只为偶尔对比旧二进制。
+/build-old/
+/build-fail*-old/

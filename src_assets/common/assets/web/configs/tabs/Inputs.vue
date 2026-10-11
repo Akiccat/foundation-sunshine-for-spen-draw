@@ -2,6 +2,7 @@
 import { reactive, computed, onMounted, onBeforeUnmount, toRef } from 'vue'
 import { useI18n } from 'vue-i18n'
 import PlatformLayout from '../../components/layout/PlatformLayout.vue'
+import DrawingModeCard from './inputs/DrawingModeCard.vue'
 
 const { t } = useI18n()
 
@@ -376,6 +377,9 @@ onBeforeUnmount(() => {
       </div>
       <div class="form-text">{{ $t('config.native_pen_touch_desc') }}</div>
     </div>
+
+    <!-- SuperSun drawing mode preset (includes the USB link + high-res pressure panels) -->
+    <DrawingModeCard v-if="platform === 'windows'" />
 
     <!-- Native touchpad optimization -->
     <div class="mb-3" v-if="config.mouse === 'enabled' && platform === 'windows'">

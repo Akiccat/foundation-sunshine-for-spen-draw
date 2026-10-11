@@ -29,6 +29,12 @@
 #include <ctime>
 #include <thread>
 #include <utility>
+#include <vector>
+
+#ifdef _WIN32
+  #define WIN32_LEAN_AND_MEAN
+  #include <windows.h>
+#endif
 
 #include <openssl/evp.h>
 #include <openssl/sha.h>
@@ -84,6 +90,9 @@
 #ifdef _WIN32
   #include "ds5/config_api.h"
   #include <iphlpapi.h>
+  #include "platform/run_command.h"
+  #include <tlhelp32.h>  // CreateToolhelp32Snapshot, for the "app is running" check
+  #include <cctype>  // std::tolower for case-insensitive app matching
   #include "display_device/vdd_utils.h"
   #include "platform/windows/display_device/color_profile.h"
   #include "platform/windows/mic_write.h"
@@ -2015,6 +2024,1691 @@ namespace confighttp {
       {"problem_code_valid", status.problem_code_valid},
       {"problem_code", status.problem_code},
       {"version_supported", false},
+    });
+  }
+
+  /**
+   * @brief Deployment helper for our own Wintab32.dll.
+   *
+   * Windows resolves Wintab32.dll from the application directory before
+   * System32, so dropping our build next to a drawing app's exe makes that one
+   * app use it while everything else keeps whatever Wintab driver is installed.
+   * That makes "install" a plain file copy and "uninstall" a delete -- no
+   * driver store, no reboot, nothing global.
+   */
+  namespace wintab_deploy {
+    // Apps that read WinTab and therefore can benefit. Matched against the
+    // DisplayName of registered uninstall entries, then confirmed by looking
+    // for the exe under InstallLocation.
+    struct target_t {
+      const char *name;
+      const char *exe;
+      const char *match;
+    };
+
+    constexpr target_t kTargets[] = {
+      { "Clip Studio Paint", "CLIPStudioPaint.exe", "clip studio" },
+      { "Krita", "krita.exe", "krita" },
+      { "Adobe Photoshop", "Photoshop.exe", "photoshop" },
+      { "Paint Tool SAI", "sai.exe", "paint tool sai" },
+      { "FireAlpaca", "FireAlpaca.exe", "firealpaca" },
+      { "MediBang Paint", "MediBangPaint.exe", "medibang" },
+      { "OpenCanvas", "OpenCanvas.exe", "opencanvas" },
+      { "Blender", "blender.exe", "blender" },
+    };
+
+    constexpr auto kDllName = "Wintab32.dll";
+
+    std::filesystem::path
+    bundled_dll_path() {
+      // SUNSHINE_ASSETS_DIR is <root>/assets, so this is <root>/tools/wintab/.
+      return file_handler::path_from_utf8(SUNSHINE_ASSETS_DIR).parent_path() / "tools" / "wintab" / kDllName;
+    }
+
+    // Cheap rolling hash; enough to tell "our build" from "some other Wintab32".
+    std::uint64_t
+    hash_file(const std::filesystem::path &path) {
+      std::ifstream in(path, std::ios::binary);
+      if (!in) return 0;
+
+      std::uint64_t h = 1469598103934665603ull;
+      char buf[65536];
+      while (in.read(buf, sizeof(buf)) || in.gcount()) {
+        for (std::streamsize i = 0; i < in.gcount(); ++i) {
+          h ^= (unsigned char) buf[i];
+          h *= 1099511628211ull;
+        }
+      }
+      return h;
+    }
+
+    bool
+    process_running(const std::string &exe_name) {
+      HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
+      if (snap == INVALID_HANDLE_VALUE) return false;
+
+      PROCESSENTRY32W pe {};
+      pe.dwSize = sizeof(pe);
+      bool found = false;
+      if (Process32FirstW(snap, &pe)) {
+        do {
+          std::wstring wide(pe.szExeFile);
+          std::string narrow(wide.begin(), wide.end());
+          if (!_stricmp(narrow.c_str(), exe_name.c_str())) {
+            found = true;
+            break;
+          }
+        } while (Process32NextW(snap, &pe));
+      }
+      CloseHandle(snap);
+      return found;
+    }
+
+    bool
+    dir_writable(const std::filesystem::path &dir) {
+      std::error_code ec;
+      if (!std::filesystem::is_directory(dir, ec)) return false;
+
+      const auto probe = dir / ".superwintab_probe.tmp";
+      {
+        std::ofstream out(probe, std::ios::binary);
+        if (!out) return false;
+        out << "x";
+      }
+      std::filesystem::remove(probe, ec);
+      return true;
+    }
+
+    // Search a few levels down from an install location for the app's exe.
+    std::filesystem::path
+    find_exe_dir(const std::filesystem::path &root, const std::string &exe) {
+      std::error_code ec;
+      if (root.empty() || !std::filesystem::is_directory(root, ec)) return {};
+
+      constexpr int kMaxDepth = 3;
+      for (std::filesystem::recursive_directory_iterator it(root, std::filesystem::directory_options::skip_permission_denied, ec), end;
+           it != end; it.increment(ec)) {
+        if (ec) break;
+        if (it->is_directory(ec) && it.depth() >= kMaxDepth) {
+          it.disable_recursion_pending();
+          continue;
+        }
+        if (!it->is_regular_file(ec)) continue;
+        if (_stricmp(it->path().filename().string().c_str(), exe.c_str())) continue;
+        return it->path().parent_path();
+      }
+      return {};
+    }
+
+    std::vector<std::string>
+    uninstall_hive_paths() {
+      return {
+        R"(SOFTWARE\Microsoft\Windows\CurrentVersion\Uninstall)",
+        R"(SOFTWARE\WOW6432Node\Microsoft\Windows\CurrentVersion\Uninstall)",
+      };
+    }
+
+    std::vector<std::pair<std::string, std::string>>
+    installed_app_locations() {
+      std::vector<std::pair<std::string, std::string>> out;  // {display name, install location}
+
+      for (const auto &hive : uninstall_hive_paths()) {
+        HKEY root_key = nullptr;
+        if (RegOpenKeyExA(HKEY_LOCAL_MACHINE, hive.c_str(), 0, KEY_READ, &root_key) != ERROR_SUCCESS) continue;
+
+        for (DWORD i = 0;; ++i) {
+          char name[512];
+          DWORD name_len = sizeof(name);
+          if (RegEnumKeyExA(root_key, i, name, &name_len, nullptr, nullptr, nullptr, nullptr) != ERROR_SUCCESS) break;
+
+          HKEY key = nullptr;
+          if (RegOpenKeyExA(root_key, name, 0, KEY_READ, &key) != ERROR_SUCCESS) continue;
+
+          char display[512] {};
+          DWORD size = sizeof(display);
+          DWORD type = 0;
+          bool have_display = RegQueryValueExA(key, "DisplayName", nullptr, &type, (LPBYTE) display, &size) == ERROR_SUCCESS;
+
+          char location[1024] {};
+          size = sizeof(location);
+          bool have_location = RegQueryValueExA(key, "InstallLocation", nullptr, &type, (LPBYTE) location, &size) == ERROR_SUCCESS;
+
+          RegCloseKey(key);
+
+          if (have_display && have_location && location[0]) {
+            out.emplace_back(display, location);
+          }
+        }
+        RegCloseKey(root_key);
+      }
+      return out;
+    }
+
+    nlohmann::json
+    describe(const std::filesystem::path &dir, const std::string &name, const std::string &exe) {
+      std::error_code ec;
+      const auto dll = dir / kDllName;
+      const bool installed = std::filesystem::exists(dll, ec);
+      const auto bundled = bundled_dll_path();
+      const bool bundled_present = std::filesystem::exists(bundled, ec);
+
+      std::uint64_t dll_hash = installed ? hash_file(dll) : 0;
+      std::uint64_t bundled_hash = bundled_present ? hash_file(bundled) : 0;
+
+      return nlohmann::json {
+        { "name", name },
+        { "dir", file_handler::path_to_utf8(dir) },
+        { "exe", exe },
+        { "found", true },
+        { "installed", installed },
+        { "match", installed && bundled_present && dll_hash != 0 && dll_hash == bundled_hash },
+        { "writable", dir_writable(dir) },
+        { "running", process_running(exe) },
+      };
+    }
+
+    std::vector<nlohmann::json>
+    discover() {
+      const auto apps = installed_app_locations();
+      std::vector<nlohmann::json> out;
+
+      for (const auto &target : kTargets) {
+        for (const auto &[display, location] : apps) {
+          std::string lower;
+          lower.reserve(display.size());
+          for (char c : display) lower.push_back((char) std::tolower((unsigned char) c));
+          if (lower.find(target.match) == std::string::npos) continue;
+
+          const auto dir = find_exe_dir(std::filesystem::path(location), target.exe);
+          if (dir.empty()) continue;
+
+          out.push_back(describe(dir, target.name, target.exe));
+          break;
+        }
+      }
+      return out;
+    }
+
+    // Copy the bundled DLL next to an app's exe. Returns false when the target is
+    // missing, not a directory, or locked by a running instance.
+    bool
+    install_into(const std::filesystem::path &dir, std::string *error = nullptr) {
+      std::error_code ec;
+      const auto bundled = bundled_dll_path();
+      if (!std::filesystem::exists(bundled, ec)) {
+        if (error) *error = "缺少内置的 Wintab32.dll";
+        return false;
+      }
+      if (!std::filesystem::is_directory(dir, ec)) {
+        if (error) *error = "不是目录: " + file_handler::path_to_utf8(dir);
+        return false;
+      }
+
+      const auto target = dir / kDllName;
+      if (std::filesystem::exists(target, ec)) {
+        // A running app holds the DLL open; overwriting fails with a sharing
+        // violation, so remove first and report that plainly.
+        std::filesystem::remove(target, ec);
+        if (ec) {
+          if (error) *error = "目标程序可能正在运行并锁定了 DLL";
+          return false;
+        }
+      }
+
+      std::filesystem::copy_file(bundled, target, std::filesystem::copy_options::overwrite_existing, ec);
+      if (ec) {
+        if (error) *error = ec.message();
+        return false;
+      }
+      return true;
+    }
+  }  // namespace wintab_deploy
+
+  void
+  getWintabStatus(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+    using namespace wintab_deploy;
+
+    std::error_code ec;
+    const auto bundled = bundled_dll_path();
+    const bool bundled_present = std::filesystem::exists(bundled, ec);
+
+    send_response(response, nlohmann::json {
+      { "status", true },
+      { "bundled", bundled_present },
+      // weakly_canonical so the UI shows a real path: SUNSHINE_ASSETS_DIR is a
+      // relative "assets", which on its own tells the user nothing.
+      { "bundled_path", file_handler::path_to_utf8(fs::weakly_canonical(bundled)) },
+      { "targets", discover() },
+    });
+  }
+
+  void
+  installWintab(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+    using namespace wintab_deploy;
+
+    std::string dir;
+    try {
+      auto tree = nlohmann::json::parse(request->content.string());
+      dir = tree.value("dir", std::string {});
+    }
+    catch (const std::exception &) {
+      send_response(response, nlohmann::json { { "status", false }, { "message", "Invalid request body" } });
+      return;
+    }
+
+    if (dir.empty()) {
+      send_response(response, nlohmann::json { { "status", false }, { "message", "No target directory given" } });
+      return;
+    }
+
+    std::error_code ec;
+    const auto bundled = bundled_dll_path();
+    if (!std::filesystem::exists(bundled, ec)) {
+      send_response(response, nlohmann::json {
+        { "status", false },
+        { "message", "Bundled Wintab32.dll is missing from " + file_handler::path_to_utf8(fs::weakly_canonical(bundled)) },
+      });
+      return;
+    }
+
+    const std::filesystem::path target_dir(dir);
+    if (!std::filesystem::is_directory(target_dir, ec)) {
+      send_response(response, nlohmann::json { { "status", false }, { "message", "Not a directory: " + dir } });
+      return;
+    }
+
+    const auto target = target_dir / kDllName;
+    if (std::filesystem::exists(target, ec)) {
+      // A running app holds the DLL open; overwriting it fails with a sharing
+      // violation. Say so plainly instead of surfacing a raw error code.
+      std::filesystem::remove(target, ec);
+      if (ec) {
+        send_response(response, nlohmann::json {
+          { "status", false },
+          { "message", "无法替换现有的 Wintab32.dll —— 目标程序可能正在运行并锁定了它，请先关闭该程序再重试。" },
+        });
+        return;
+      }
+    }
+
+    std::filesystem::copy_file(bundled, target, std::filesystem::copy_options::overwrite_existing, ec);
+    if (ec) {
+      send_response(response, nlohmann::json {
+        { "status", false },
+        { "message", "Copy failed: " + ec.message() },
+      });
+      return;
+    }
+
+    BOOST_LOG(info) << "SuperSun: installed Wintab32.dll into "sv << dir;
+    send_response(response, nlohmann::json { { "status", true }, { "message", "已安装，重启该绘图程序后生效。" } });
+  }
+
+  void
+  uninstallWintab(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+    using namespace wintab_deploy;
+
+    std::string dir;
+    try {
+      auto tree = nlohmann::json::parse(request->content.string());
+      dir = tree.value("dir", std::string {});
+    }
+    catch (const std::exception &) {
+      send_response(response, nlohmann::json { { "status", false }, { "message", "Invalid request body" } });
+      return;
+    }
+
+    std::error_code ec;
+    const auto target = std::filesystem::path(dir) / kDllName;
+    if (!std::filesystem::exists(target, ec)) {
+      send_response(response, nlohmann::json { { "status", true }, { "message", "本来就没有安装。" } });
+      return;
+    }
+
+    std::filesystem::remove(target, ec);
+    if (ec) {
+      send_response(response, nlohmann::json {
+        { "status", false },
+        { "message", "无法删除 —— 目标程序可能正在运行，请先关闭它。" },
+      });
+      return;
+    }
+
+    BOOST_LOG(info) << "SuperSun: removed Wintab32.dll from "sv << dir;
+    send_response(response, nlohmann::json { { "status", true }, { "message", "已卸载。" } });
+  }
+
+  // ---------------------------------------------------------------------------
+  // 绘画模式 (Drawing Mode) preset
+  //
+  // "让以上功能全开" in one click: every S Pen channel enabled, the pen tuning
+  // keys that used to be env-var-only, HEVC 4:4:4 with a high bitrate ceiling,
+  // AV1 off (Snapdragon 865+ has no AV1 decoder), the tablet kept as an extended
+  // display, and a 16:10 4K mode added to the virtual display's mode list.
+  // ---------------------------------------------------------------------------
+  // ---------------------------------------------------------------------------
+  // USB tether link detection + high-bandwidth switch.
+  //
+  // Sunshine itself never cared how the packets travel: it binds 0.0.0.0, so any
+  // IP link works, including the USB RNDIS/NCM link Android exposes after USB
+  // tethering. What used to cap throughput lives mostly on the *client* side:
+  // moonlight-common-c clamps maximumBitrateKbps to 100 Mbps "because GFE", and
+  // the settings slider stopped at 150 Mbps. Neither number means anything on a
+  // wired link that measures ~1 Gbit/s at ~2 ms with no measurable loss.
+  //
+  // This namespace does the two things the host can actually do about it: tell
+  // the operator whether such a link exists right now, and lift the host-side
+  // ceilings (max_bitrate / fec_percentage) to match it.
+  // ---------------------------------------------------------------------------
+  namespace usb_link {
+    // Wi-Fi-ish fallback: what drawing mode writes for a normal LAN/WLAN stream.
+    constexpr int kWifiMaxBitrateKbps = 150000;
+    constexpr int kWifiFecPercentage = 20;
+    // USB: forward error correction is insurance against packet loss, and a wired
+    // tether has none. 20% redundancy would be 20% of the pipe spent on nothing.
+    constexpr int kUsbFecPercentage = 5;
+    // Hard ceiling accepted elsewhere in Sunshine (stream.cpp rejects above it).
+    constexpr int kAbsoluteMaxBitrateKbps = 800000;
+
+    // Windows does not flag "this adapter is a phone tether", and friendly names
+    // get localised ("以太网 2"), so match both name and driver description.
+    constexpr std::string_view kTetherHints[] = {
+      "remote ndis"sv, "rndis"sv, "ncm"sv, "android"sv,
+      "usb ethernet"sv, "ethernet over usb"sv, "tether"sv, "adb"sv,
+    };
+
+    // Beware a 10/100 Mbit pseudo-adapter being promoted to "USB link".
+    constexpr std::uint64_t kMinLinkSpeedBps = 100ULL * 1000ULL * 1000ULL;
+
+    // Bitrate presets for a USB tether, in Kbps.
+    //
+    // These are deliberately *not* derived from the adapter's reported link
+    // speed. A USB RNDIS adapter reports a nominal figure baked into the driver
+    // (almost always exactly 1 Gbit/s) that has nothing to do with what the USB
+    // link actually negotiated: put a USB 2.0 cable in and Windows still says
+    // 1 Gbit/s while real TCP throughput collapses to ~300 Mbps. Deriving a
+    // 70%-of-1-Gbit recommendation from that number would hand out 700 Mbps to
+    // someone on a 300 Mbps link, which stutters far worse than the 150 Mbps
+    // default it replaced.
+    //
+    // Measured on the target hardware (Galaxy Tab S7+ SM-T970, whose USB-C port
+    // is USB 3.2 Gen 1 / 5 Gbit/s -- not USB 2.0): ~991 Mbit/s TCP, ~2 ms, zero
+    // loss. So the aggressive preset still leaves headroom here, but it is the
+    // user's call, not something we infer from a meaningless number.
+    constexpr int kUsbConservativeKbps = 200000;
+    constexpr int kUsbBalancedKbps = 400000;
+    constexpr int kUsbAggressiveKbps = kAbsoluteMaxBitrateKbps;  // 800 Mbps, the ceiling stream.cpp accepts
+
+    struct link_info {
+      bool present = false;
+      std::string adapter;
+      std::string description;
+      std::string ip;
+      std::uint64_t speed_bps = 0;
+      /// False for RNDIS: the reported speed is a driver constant, not a measurement.
+      bool speed_reliable = true;
+      std::string hint;
+    };
+
+#ifdef _WIN32
+    std::string
+    utf8_from_wide(const WCHAR *wide) {
+      if (!wide) return {};
+      const int len = WideCharToMultiByte(CP_UTF8, 0, wide, -1, nullptr, 0, nullptr, nullptr);
+      if (len <= 1) return {};
+      std::string out((std::size_t) (len - 1), '\0');
+      WideCharToMultiByte(CP_UTF8, 0, wide, -1, out.data(), len, nullptr, nullptr);
+      return out;
+    }
+
+    std::string
+    lower(std::string value) {
+      for (auto &c : value) c = (char) std::tolower((unsigned char) c);
+      return value;
+    }
+
+    bool
+    looks_like_tether(const std::string &text) {
+      const auto haystack = lower(text);
+      if (haystack.empty()) return false;
+      for (const auto hint : kTetherHints) {
+        if (haystack.find(hint) != std::string::npos) return true;
+      }
+      return false;
+    }
+
+    // RNDIS is the classic Android tether protocol, and it is precisely the one
+    // whose reported link speed is a hardcoded 1 Gbit/s rather than a measurement.
+    bool
+    looks_like_rndis(const std::string &text) {
+      const auto haystack = lower(text);
+      return haystack.find("rndis") != std::string::npos ||
+             haystack.find("remote ndis") != std::string::npos;
+    }
+
+    // Link speeds are not part of IP_ADAPTER_ADDRESSES; they live in MIB_IF_TABLE2
+    // keyed by the same IfIndex.
+    std::uint64_t
+    link_speed_for(NET_IFINDEX if_index) {
+      PMIB_IF_TABLE2 table = nullptr;
+      if (GetIfTable2(&table) != NO_ERROR || table == nullptr) return 0;
+
+      std::uint64_t speed = 0;
+      for (ULONG i = 0; i < table->NumEntries; ++i) {
+        const auto &row = table->Table[i];
+        if (row.InterfaceIndex != if_index) continue;
+        speed = std::max<std::uint64_t>(row.ReceiveLinkSpeed, row.TransmitLinkSpeed);
+        break;
+      }
+
+      FreeMibTable(table);
+      return speed;
+    }
+
+    link_info
+    detect() {
+      link_info info;
+
+      ULONG length = 15000;
+      std::vector<std::uint8_t> buffer(length);
+      auto addresses = reinterpret_cast<PIP_ADAPTER_ADDRESSES>(buffer.data());
+
+      if (GetAdaptersAddresses(AF_INET, GAA_FLAG_SKIP_ANYCAST | GAA_FLAG_SKIP_MULTICAST, nullptr, addresses, &length) != NO_ERROR) {
+        info.hint = "枚举网卡失败（GetAdaptersAddresses）";
+        return info;
+      }
+
+      std::uint64_t slowest_seen = 0;
+
+      for (auto adapter = addresses; adapter != nullptr; adapter = adapter->Next) {
+        if (adapter->OperStatus != IfOperStatusUp) continue;
+        if (adapter->IfType == IF_TYPE_TUNNEL || adapter->IfType == IF_TYPE_PPP) continue;
+
+        const auto description = utf8_from_wide(adapter->Description);
+        const auto friendly = utf8_from_wide(adapter->FriendlyName);
+        if (!looks_like_tether(description) && !looks_like_tether(friendly)) continue;
+
+        const auto speed = link_speed_for(adapter->IfIndex);
+        if (speed < kMinLinkSpeedBps) {
+          slowest_seen = speed;
+          continue;
+        }
+
+        std::string ip;
+        for (auto unicast = adapter->FirstUnicastAddress; unicast != nullptr; unicast = unicast->Next) {
+          if (unicast->Address.lpSockaddr->sa_family != AF_INET) continue;
+          auto sin = reinterpret_cast<sockaddr_in *>(unicast->Address.lpSockaddr);
+          // 169.254/16 is the APIPA address every tethered interface also gets.
+          if ((ntohl(sin->sin_addr.s_addr) >> 16) == 0xA9FE) continue;
+          ip = boost::asio::ip::address_v4(ntohl(sin->sin_addr.s_addr)).to_string();
+          break;
+        }
+        if (ip.empty()) continue;
+
+        // A tablet often registers several plausible entries; keep the fastest.
+        if (speed <= info.speed_bps) continue;
+
+        info.present = true;
+        info.adapter = friendly.empty() ? description : friendly;
+        info.description = description;
+        info.ip = ip;
+        info.speed_bps = speed;
+        // Any USB tether is a virtual NIC, so this is whatever the gadget driver
+        // claims -- typically a fixed 1 Gbit/s -- and never a measurement. RNDIS
+        // is the worst offender and gets an extra nudge towards NCM below.
+        info.speed_reliable = false;
+      }
+
+      if (!info.present && info.hint.empty()) {
+        info.hint = slowest_seen > 0
+                      ? "找到 USB 网卡但它还没协商到可用速率（" + std::to_string(slowest_seen / 1000000) + " Mbps）。"
+                      : "没有检测到已连接的 USB 网卡。请先用 adb 打开 USB 网络共享。";
+      }
+
+      // NCM is not a free win, so do not sell it as one. It batches many Ethernet
+      // frames into one USB transfer, which is unambiguously cheaper on CPU and
+      // wins on bulk throughput -- but the batching waits to fill a transfer, and
+      // in a latency-sensitive small-packet workload (pen input, cursor moves)
+      // that wait can cost more than it saves. USB NCM support on Windows is also
+      // patchier than RNDIS, which every Windows since XP has handled natively.
+      // Mention it as an experiment to measure, not an upgrade to apply.
+      if (info.present && info.hint.empty() && looks_like_rndis(info.description)) {
+        info.hint = "当前是 RNDIS。NCM 靠帧聚合能明显省 CPU、高负载吞吐更好，"
+                    "但聚合等待对小包延迟未必有利，且 Windows 对 USB NCM 的支持不如 RNDIS 稳。"
+                    "要试：adb shell svc usb setFunctions ncm,adb（Android 11+），"
+                    "切完实测吞吐和 ping 再决定，别直接当升级。";
+      }
+      return info;
+    }
+
+    // Windows classifies every newly seen adapter as an unidentified network,
+    // which means "public profile" -- and inbound Sunshine ports get dropped.
+    // usb_link.py used to print these commands for the user to paste; since
+    // Sunshine already runs elevated (ZakoVDD needs it) we can just run them.
+    //
+    // Only ever touches rules named kFirewallRule*, so removing is reversible and
+    // nothing else in the user's firewall policy is disturbed.
+    constexpr char kFirewallRuleTcp[] = "Sunshine USB (TCP)";
+    constexpr char kFirewallRuleUdp[] = "Sunshine USB (UDP)";
+
+    std::string
+    quote(const std::string &value) {
+      return "\"" + value + "\"";
+    }
+
+    std::string
+    port_list(const std::vector<int> &offsets) {
+      // Offsets are relative to the configured base port, see net::map_port().
+      std::string out;
+      for (auto offset : offsets) {
+        if (!out.empty()) out += ",";
+        out += std::to_string(net::map_port(offset));
+      }
+      return out;
+    }
+
+    int
+    run_netsh(const std::string &arguments, std::string *output) {
+      boost::filesystem::path working_dir;
+      static const boost::process::v1::environment env = boost::this_process::environment();
+      std::error_code ec;
+
+      auto child = platf::run_command(false, false, "netsh " + arguments, working_dir, env, nullptr, ec, nullptr);
+      if (ec) {
+        if (output) *output = ec.message();
+        return -1;
+      }
+
+      if (child.running()) child.wait();
+      return child.exit_code();
+    }
+
+    bool
+    ensure_firewall_rules(bool enable, std::string *error, std::vector<std::string> &changed) {
+      const std::vector<int> tcp_ports {
+        nvhttp::PORT_HTTP,
+        nvhttp::PORT_HTTPS,
+        confighttp::PORT_HTTPS,
+        rtsp_stream::RTSP_SETUP_PORT,
+      };
+      const std::vector<int> udp_ports {
+        stream::VIDEO_STREAM_PORT,
+        stream::CONTROL_PORT,
+        stream::AUDIO_STREAM_PORT,
+        stream::MIC_STREAM_PORT,
+      };
+
+      // mDNS. This is the reason "unplug and it can't find the PC": the tether
+      // adapter lands on the public profile, so without 5353 the tablet's
+      // discovery query never arrives and discovery looks simply broken -- you
+      // end up having to type the IP by hand. It is a fixed port, not an offset
+      // from our base port, so it is appended rather than run through map_port.
+      constexpr int kMdnsPort = 5353;
+
+      for (const auto pass : { 0, 1 }) {
+        const bool tcp = pass == 0;
+        const auto &rule_name = tcp ? kFirewallRuleTcp : kFirewallRuleUdp;
+        const auto ports = tcp ? port_list(tcp_ports)
+                               : port_list(udp_ports) + "," + std::to_string(kMdnsPort);
+
+        std::string ignored;
+        const auto show = std::string { "advfirewall firewall show rule name=" } + quote(rule_name);
+        const int exists = run_netsh(show, &ignored);
+
+        if (enable) {
+          // Delete first, do not skip when a rule already exists. An existing rule
+          // can predate the current port list -- that is exactly what happened with
+          // the mDNS port, which was added after the rule had been created: the
+          // rule was "already there" and silently kept blocking 5353. Recreating is
+          // idempotent and keeps the port list honest.
+          run_netsh(std::string { "advfirewall firewall delete rule name=" } + quote(rule_name), &ignored);
+          const auto add = std::string { "advfirewall firewall add rule name=" } + quote(rule_name) +
+                           " dir=in action=allow profile=any" +
+                           " protocol=" + (tcp ? "TCP" : "UDP") +
+                           " localport=" + ports;
+          std::string message;
+          if (run_netsh(add, &message) != 0) {
+            if (error) *error = "添加防火墙规则失败（Sunshine 需要以管理员运行）：" + message;
+            return false;
+          }
+          changed.push_back((tcp ? "防火墙入站 TCP " : "防火墙入站 UDP ") + ports + " 已放行");
+        }
+        else {
+          if (exists != 0) continue;  // 本来就没有
+          const auto del = std::string { "advfirewall firewall delete rule name=" } + quote(rule_name);
+          std::string message;
+          if (run_netsh(del, &message) != 0) {
+            if (error) *error = "删除防火墙规则失败：" + message;
+            return false;
+          }
+          changed.push_back((tcp ? "防火墙入站 TCP " : "防火墙入站 UDP ") + ports + " 已还原");
+        }
+      }
+
+      BOOST_LOG(info) << "SuperSun: USB firewall rules "sv
+                      << (enable ? "added"sv : "removed"sv)
+                      << " (base port "sv << config::sunshine.port << ")";
+      return true;
+    }
+#else
+    link_info
+    detect() {
+      link_info info;
+      info.hint = "USB 链路检测目前只实现了 Windows 版本。";
+      return info;
+    }
+
+    // Non-Windows stub: mirrors the Windows function used in applyUsbLink().
+    bool
+    ensure_firewall_rules(bool enable, std::string *error, std::vector<std::string> &changed) {
+      (void) enable;
+      (void) changed;
+      if (error) *error = "防火墙放行目前只实现了 Windows 版本。";
+      return false;
+    }
+#endif
+
+    // Deliberately a preset, not a fraction of the reported speed -- see the
+    // comment on kUsbBalancedKbps. Balanced is the default: comfortably inside
+    // the ~991 Mbit/s this hardware actually sustains, and still sane if the
+    // user swapped in a USB 2.0 cable (which would cap TCP at ~300 Mbps).
+    int
+    recommended_bitrate_kbps(const link_info &info) {
+      if (!info.present) return kWifiMaxBitrateKbps;
+      return kUsbBalancedKbps;
+    }
+
+    void
+    build_bandwidth_patch(std::map<std::string, std::string> &patch, bool enable, int usb_bitrate_kbps) {
+      if (enable) {
+        patch["max_bitrate"] = std::to_string(usb_bitrate_kbps);
+        patch["fec_percentage"] = std::to_string(kUsbFecPercentage);
+      }
+      else {
+        patch["max_bitrate"] = std::to_string(kWifiMaxBitrateKbps);
+        patch["fec_percentage"] = std::to_string(kWifiFecPercentage);
+      }
+    }
+
+    // --- switching the tethering protocol between RNDIS and NCM ----------
+    //
+    // Offered because NCM is measurably cheaper on CPU, not because it is an
+    // upgrade: see the comparison table in docs/USB直连与码率天花板.md. Switching
+    // re-enumerates the USB device, so the link drops and the static IPs have to
+    // be laid down again afterwards (usb_link.py up --mode <mode> does that).
+
+    std::string
+    find_adb() {
+      const auto snapshot = config::get_config_snapshot();
+      if (snapshot) {
+        const auto it = snapshot->find("usb_adb_path");
+        if (it != snapshot->end() && !it->second.empty() && fs::exists(it->second)) {
+          return it->second;
+        }
+      }
+
+      for (const auto candidate : { "E:/DshProject/platform-tools/adb.exe" }) {
+        if (fs::exists(candidate)) return candidate;
+      }
+
+#ifdef _WIN32
+      // anything on PATH
+      wchar_t buffer[MAX_PATH];
+      const auto length = SearchPathW(nullptr, L"adb.exe", nullptr, MAX_PATH, buffer, nullptr);
+      if (length > 0 && length < MAX_PATH) {
+        const std::wstring wide(buffer, (std::size_t) length);
+        const int bytes = WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, nullptr, 0, nullptr, nullptr);
+        if (bytes > 1) {
+          std::string out((std::size_t) (bytes - 1), '\0');
+          WideCharToMultiByte(CP_UTF8, 0, wide.c_str(), -1, out.data(), bytes, nullptr, nullptr);
+          return out;
+        }
+      }
+#endif
+      return {};
+    }
+
+    int
+    run_capture(const std::string &cmd, std::string &out) {
+#ifdef _WIN32
+      FILE *pipe = _popen(cmd.c_str(), "r");
+#else
+      FILE *pipe = popen(cmd.c_str(), "r");
+#endif
+      if (!pipe) return -1;
+      char buffer[1024];
+      while (fgets(buffer, sizeof(buffer), pipe)) out += buffer;
+#ifdef _WIN32
+      return _pclose(pipe);
+#else
+      return pclose(pipe);
+#endif
+    }
+
+    /// Which protocol the current tether is using, inferred from the adapter description.
+    std::string
+    mode_from_description(const std::string &description) {
+      const auto haystack = [](std::string value) {
+        for (auto &c : value) c = (char) std::tolower((unsigned char) c);
+        return value;
+      }(description);
+      if (haystack.find("ncm") != std::string::npos) return "ncm";
+      if (haystack.find("rndis") != std::string::npos) return "rndis";
+      return "unknown";
+    }
+
+    struct switch_result {
+      bool ok = false;
+      std::string output;
+      std::string detail;
+    };
+
+    switch_result
+    switch_usb_mode(const std::string &mode) {
+      switch_result result;
+
+      if (mode != "rndis" && mode != "ncm") {
+        result.detail = "只支持 rndis / ncm。";
+        return result;
+      }
+
+      const auto adb = find_adb();
+      if (adb.empty()) {
+        result.detail = "没找到 adb.exe。在 sunshine.conf 里加一行 usb_adb_path = <完整路径> 再试。";
+        return result;
+      }
+
+      const auto quoted = "\"" + adb + "\"";
+      // `svc usb` needs root on the device, so escalate through su the same way
+      // usb_link.py does. No shell quoting: adb joins its arguments with spaces
+      // and the device shell mksh splits them back apart.
+      const std::vector<std::string> attempts {
+        quoted + " shell svc usb setFunctions " + mode + ",adb",
+        quoted + " shell su -c svc usb setFunctions " + mode + ",adb",
+        quoted + " shell su -c setprop sys.usb.config " + mode + ",adb",
+      };
+
+      for (const auto &cmd : attempts) {
+        std::string out;
+        const int rc = run_capture(cmd, out);
+        result.output += "$ " + cmd + "\n" + out + "\n";
+        if (rc == 0) {
+          result.ok = true;
+          return result;
+        }
+      }
+
+      result.detail = "三条命令都失败了。常见原因：平板没给 shell root 授权，或 adb 设备不在线。";
+      return result;
+    }
+  }  // namespace usb_link
+
+  namespace drawing_mode {
+    // ---------------------------------------------------------------------
+    // Every setting this card can touch, described well enough that the user
+    // can decide for themselves.
+    //
+    // The previous design applied a fixed preset in one shot. That was wrong in
+    // two ways: the user could not see what was about to change, and the preset
+    // overwrote choices they had made by hand (it kept turning nvenc_spatial_aq
+    // back on after latency work had turned it off). So the preset is gone and
+    // the UI now renders this list instead: each row states what the setting
+    // does, shows the current value, and only writes the ones the user
+    // actually changes.
+    // ---------------------------------------------------------------------
+
+    /// How the UI should render a row.
+    enum class control_t {
+      toggle,  ///< on/off
+      choice,  ///< fixed set of string values
+      number,  ///< numeric, with min/max
+      text,    ///< free-form string
+    };
+
+    struct option_t {
+      std::string key;
+      control_t control;
+      /// Grouping in the UI, so related settings sit together.
+      const char *group;
+      /// What the setting does, in the user's language.
+      const char *label;
+      const char *help;
+      /// The value we suggest. Only ever used as the initial state of the
+      /// editor -- it is written when the user saves, never on its own.
+      std::string recommended;
+      /// For control_t::choice
+      std::vector<std::string> choices;
+      /// Per-choice explanation, parallel to `choices`. Empty entries fall back
+      /// to the raw value. A dropdown that just says "1 / 2 / 3 / autoselect"
+      /// tells the reader nothing about what they are picking.
+      std::vector<const char *> choice_notes;
+      /// For control_t::number. Doubles, not integers: pen_pressure_gamma is a
+      /// float (0.7 recommended) and validating it as an integer made the one
+      /// setting people care most about impossible to save.
+      double min = 0.0;
+      double max = 0.0;
+      /// Step the UI should offer. 0 means "derive it" (integers get 1).
+      double step = 0.0;
+    };
+
+    const std::vector<option_t> &
+    options() {
+      using enum control_t;
+      static const std::vector<option_t> opts {
+        // The input channels (keyboard / mouse / controller / scancodes /
+        // scrolling / native pen / touchpad / virtual mouse / cursor) and the
+        // codec modes (hevc_mode / av1_mode) are deliberately NOT repeated here:
+        // they already have editors on the Input and Advanced pages, and two
+        // entries for one key is how this panel started contradicting itself.
+        // Only settings with no other home belong in this list.
+        //
+        // max_bitrate is absent for the same reason -- the wired-link section
+        // further down owns it and shows the live value.
+
+        // --- 压感手感（全局设置里没有对应项） ---
+        { "pen_pressure_gamma", number, "pen",
+          "压感曲线",
+          "小于 1.0 会把压力配额往轻压端挪，轻笔触不再全挤在最低的几级；"
+          "1.0 是线性；大于 1.0 则重压更重。",
+          // config.cpp accepts 0.0 < gamma <= 4.0, so the editor must not offer
+          // anything outside that or the value would be silently dropped on
+          // the next load.
+          "0.7", {}, {}, 0.1, 4.0, 0.05 },
+        { "pen_hover_pressure", number, "pen",
+          "悬停压力",
+          "笔悬在屏幕上时上报的压力值。保持 0 —— 一旦大于 0，画图软件会以为你已经落笔，"
+          "然后在悬停时就开始画。",
+          "0", {}, {}, 0, 64, 1 },
+
+        // --- 编码器的画质 / 延迟取舍（高级页只给编码器与模式，不给这些） ---
+        { "downscaling_quality", choice, "video",
+          "缩放算法",
+          "画面缩到平板分辨率时的插值方式。high_quality 最锐利，也最吃 CPU。",
+          "high_quality", { "fast", "balanced", "high_quality" },
+          { "最快，省 CPU，画面略软", "折中", "最锐利，最吃 CPU" }, 0, 0 },
+        { "fixed_frame_cadence", toggle, "video",
+          "固定帧率（静止时补帧）",
+          "按客户端请求的刷新率固定出帧，画面不动时也照常发送重复帧，"
+          "帧率和延迟都不再随画面是否在动而变。\n"
+          "不开时有个隐藏的坑：循环是「先等满一个帧间隔、等不到新帧再编码」，"
+          "两段时间串行相加，静止时一帧的实际周期变成「间隔 + 编码耗时」，"
+          "60fps 的流会掉到 30~45fps，延迟在 6~9ms 之间来回摆。\n"
+          "开启后按固定栅格出帧，周期恒等于帧间隔。代价是静止时也在持续编码，"
+          "带宽小幅增加（重复帧几乎不占码率），画质无损。\n"
+          "需要重启 Sunshine 后生效。",
+          "enabled", {}, {}, 0, 0 },
+        { "nvenc_spatial_aq", toggle, "video",
+          "空间自适应量化",
+          "把码率预算从平坦处挪到细节多的区域，同码率下更锐利。"
+          "代价是一点编码时间；追求最低延迟可以关掉。",
+          "disabled", {}, {}, 0, 0 },
+        { "nvenc_lookahead_level", choice, "video",
+          "NVENC 前瞻",
+          "编码前先看后面几帧以提高压缩效率。autoselect 让驱动决定，disabled 最省延迟。",
+          "disabled", { "disabled", "1", "2", "3", "autoselect" },
+          { "关闭，最低延迟", "看1 帧，省一点码率", "看2 帧", "看3 帧，延迟最大",
+            "由驱动按内容自动决定" }, 0, 0 },
+        { "nvenc_temporal_filter", choice, "video",
+          "NVENC 时域滤波",
+          "跨帧去噪/去块。会引入延迟并糊掉细节，画精细线稿建议保持 disabled。",
+          "disabled", { "disabled", "4" },
+          { "关闭，画线稿应该保持这个", "强度4：去噪更强，但细节会被抹平" }, 0, 0 },
+
+        // --- 虚拟屏：平板在主机上被当作什么显示器（AudioVideo 页只管分辨率列表） ---
+        { "display_device_prep", choice, "display",
+          "显示器拓扑",
+          "ensure_secondary = 把虚拟屏作为扩展屏（物理屏保留）；"
+          "ensure_only_display = 关掉物理屏只留虚拟屏；"
+          "ensure_primary = 让虚拟屏成为主屏；no_operation = 不动。",
+          "ensure_secondary",
+          { "no_operation", "ensure_active", "ensure_primary", "ensure_only_display", "ensure_secondary" },
+          { "完全不动", "激活已连接的虚拟屏", "虚拟屏变主屏", "关掉物理屏，只留虚拟屏",
+            "虚拟屏作为扩展屏，物理屏保留" }, 0, 0 },
+        { "output_name", text, "display",
+          "虚拟屏适配器名",
+          "要使用的虚拟显示器适配器。用默认的 Zako 虚拟屏就填 ZakoHDR。",
+          "ZakoHDR", {}, {}, 0, 0 },
+
+        // --- 主机桌面环境（不是串流参数，是对 Windows 桌面本身动手） ---
+        { "drawing_fill_screen", toggle, "desktop",
+          "铺满并锁定虚拟屏上的窗口",
+          "绘图软件（CSP 等）最大化时只能贴到系统「工作区」，"
+          "而工作区底部被任务栏占掉一条，画布下方总留一条空隙。\n"
+          "勾选会把落在虚拟屏上的普通应用窗口拉大到整个屏幕，并**锁定**它："
+          "拖不动、缩不了，直到你在这里取消勾选。适合开始画之前先勾上，避免误碰。\n"
+          "取消勾选会完整还原窗口原来的大小、位置和边框。\n"
+          "屏幕尺寸按当前虚拟屏分辨率自动识别，改分辨率后请重新勾选。"
+          "主机屏幕上的窗口不受影响。立即生效，不需要重启 Sunshine。",
+          "disabled", {}, {}, 0, 0 },
+
+        // resolution_change and refresh_rate_change are deliberately absent:
+        // both are already "automatic" in the config, so a control here would
+        // only ever restate the current value. resolution_change stays
+        // conditional on the client's "Optimize game settings" either way.
+      };
+      return opts;
+    }
+
+    // ---------------------------------------------------------------------
+    // 把虚拟屏（副屏）上的应用窗口铺满整块屏。
+    //
+    // 为什么需要它：窗口「最大化」= 贴系统工作区( rcWork)，而工作区底部被
+    // 任务栏占掉48px。实测 CSP 最大化后底部留 71px 空隙露出桌面壁纸。
+    // explorer 的任务栏 auto-hide 也解决不了：ABM_SETSTATE(ABS_AUTOHIDE)
+    // 在 Win10/11 上返回成功但状态不落（ABM_GETSTATE恒为 0），注册表
+    // StuckRects3\TaskbarOn 等键在新版 explorer 里根本不存在。
+    // 所以不去碰工作区，直接搬窗口 —— 用 MoveWindow 的语义而不是最大化。
+    //
+    // 屏幕尺寸**一律运行时读取**，绝不写死：虚拟屏分辨率由用户自己控制
+    // （实测会在 1920x1200 / 2880x1800 等档位间切换），写死会当场失效。
+    // ---------------------------------------------------------------------
+
+    // 副屏（虚拟屏）的 rcMonitor。取不到返回 false。
+    //
+    // 用 Shell_SecondaryTrayWnd 定位而不是「非主屏」：将来若有第二块副屏，
+    // 「非主屏」会把两块一起算进来。任务栏一定和它所在的屏同属一块。
+    // 任务栏被 SW_HIDE 时 GetWindowRect 不准，所以走 MonitorFromWindow +GetMonitorInfo。
+    bool
+    secondary_monitor_rect(RECT &out) {
+      const auto taskbar = FindWindowW(L"Shell_SecondaryTrayWnd", nullptr);
+      if (taskbar == nullptr) {
+        return false;
+      }
+      const auto mon = MonitorFromWindow(taskbar, MONITOR_DEFAULTTONEAREST);
+      MONITORINFO mi {};
+      mi.cbSize = sizeof(mi);
+      if (GetMonitorInfoW(mon, &mi) == 0) {
+        return false;
+      }
+      if ((mi.dwFlags & MONITORINFOF_PRIMARY) != 0) {
+        return false;  // 万一没副屏任务栏，别把主屏交出去
+      }
+      out = mi.rcMonitor;
+      return true;
+    }
+
+    // 搬运落在副屏上的普通应用窗口。返回搬运了几个。
+    //
+    // 窗口筛选判据（每条都经实测，别随意简化）：
+    //   · 非 IsIconic                    —— 最小化的别动
+    //   · 非 WS_EX_TOOLWINDOW            —— 排除托盘小窗/DesktopWindowXamlSource
+    //   · 有 WS_CAPTION                   —— 排除 IME/通知等无边框窗口
+    //   · 有窗口标题                      —— 排除桌面等无标题窗口
+    //   · 尺寸 ≥ 屏幕 1/4                 —— 滤掉残余小窗
+    //   · 窗口中心落在副屏                —— 判「属于这块屏」
+    //   · 矩形已等于 rcMonitor            —— 已铺满则跳过，防抖动
+    //
+    // ★ 踩过的坑：曾用 GetWindow(hwnd, GW_OWNER) == nullptr 过滤普通窗口，
+    //   结果一个都选不中 —— CSP（Chromium/Qt 系）的主窗口**本身就是 owned
+    //   window 的 owner**，非 NULL，把该动的窗口全筛掉了。
+
+    // ---------------------------------------------------------------------
+    // 窗口锁定：防止用户误碰把铺满的窗口拖走 / 缩小。
+    //
+    // 做法就是改窗口样式，一次到位、不做后台轮询：
+    //   勾选   —— 记下原始 style/exstyle，去掉 WS_THICKFRAME（鼠标拖不动边框、
+    //             也拖不动标题栏以外的边），再把窗口铺满整块屏
+    //   取消   —— 把记下的 style/exstyle 原样写回
+    //
+    // 为什么不加定时器把矩形按回去：应用窗口自己不会改大小，也没人会特意
+    // 把它拖小；为了防一个不会发生的情况每200ms 醒一次不值得。
+    // （实测过：清掉 WS_THICKFRAME 后用户确实拖不动，但程序侧 SetWindowPos
+    //   仍能改矩形——那是Sunshine 自己的正常操作，不构成问题。）
+    // ---------------------------------------------------------------------
+
+    struct locked_window_t {
+      HWND hwnd {};
+      LONG_PTR style {};
+      LONG_PTR ex_style {};
+    };
+
+    // 进程级单例：Web UI 是多线程的，锁定状态要跨线程共享。
+    // 用 function-local static 而非全局变量，避免静态初始化顺序问题。
+    class window_lock_t {
+    public:
+      // 锁定一批窗口。返回真正锁上的数量。
+      int
+      engage(const std::vector<HWND> &windows) {
+        restore_styles();
+        std::lock_guard<std::mutex> guard(mutex_);
+        for (const HWND hwnd : windows) {
+          if (!IsWindow(hwnd)) {
+            continue;
+          }
+          locked_window_t entry {};
+          entry.hwnd = hwnd;
+          entry.style = ::GetWindowLongPtrW(hwnd, GWL_STYLE);
+          entry.ex_style = ::GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+          saved_.push_back(entry);
+          // 去掉可缩放边框：用户没法拖边框改大小。
+          ::SetWindowLongPtrW(hwnd, GWL_STYLE,
+                              entry.style & ~static_cast<LONG_PTR>(WS_THICKFRAME));
+        }
+        active_ = !saved_.empty();
+        return static_cast<int>(saved_.size());
+      }
+
+      // 还原被锁窗口的样式。幂等，没锁过就是空操作。
+      // 不动几何：取消时把窗口缩回原样会打乱用户手动调过的布局，
+      // 需要恢复大小自己双击标题栏最大化即可。
+      int
+      release_all() {
+        std::lock_guard<std::mutex> guard(mutex_);
+        const int n = static_cast<int>(saved_.size());
+        for (const auto &entry : saved_) {
+          if (!IsWindow(entry.hwnd)) {
+            continue;  // 窗口已关，没什么可还原
+          }
+          ::SetWindowLongPtrW(entry.hwnd, GWL_STYLE, entry.style);
+          ::SetWindowLongPtrW(entry.hwnd, GWL_EXSTYLE, entry.ex_style);
+          // 边框样式变了，必须刷新非客户区，否则会残留旧边框的绘制。
+          ::SetWindowPos(entry.hwnd, nullptr, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        }
+        saved_.clear();
+        active_ = false;
+        return n;
+      }
+
+      bool
+      active() const {
+        std::lock_guard<std::mutex> guard(mutex_);
+        return active_;
+      }
+
+      // 进程级单例入口。
+      static window_lock_t &
+      instance() {
+        static window_lock_t inst;
+        return inst;
+      }
+
+    private:
+      // 不加锁调用：只在 engage 内部、持锁之后使用。
+      void
+      restore_styles() {
+        for (const auto &entry : saved_) {
+          if (!IsWindow(entry.hwnd)) {
+            continue;
+          }
+          ::SetWindowLongPtrW(entry.hwnd, GWL_STYLE, entry.style);
+          ::SetWindowLongPtrW(entry.hwnd, GWL_EXSTYLE, entry.ex_style);
+          ::SetWindowPos(entry.hwnd, nullptr, 0, 0, 0, 0,
+                         SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_FRAMECHANGED);
+        }
+        saved_.clear();
+      }
+
+      mutable std::mutex mutex_;  // mutable：active() 是 const 查询也要加锁
+      std::vector<locked_window_t> saved_;
+      bool active_ = false;
+    };
+
+    window_lock_t &
+    window_lock() {
+      return window_lock_t::instance();
+    }
+
+    // 铺满 + 锁定，合并成一个动作。返回被处理的窗口数。
+    int
+    fill_and_lock(bool lock) {
+      RECT screen {};
+      if (!secondary_monitor_rect(screen)) {
+        BOOST_LOG(warning) << "SuperSun: no secondary monitor rect; skip fill";
+        return 0;
+      }
+
+      if (lock && window_lock().active()) {
+        return 0;  // 已经锁着，不重复搬
+      }
+
+      // 筛选逻辑与 fill_secondary_displays 相同：先把窗口铺满到屏幕，
+      // 再把选中的窗口交给锁定器。
+      // 再把它选中的窗口交给锁定器。分开实现会重复一遍筛选条件。
+      std::vector<HWND> targets;
+      const LONG screen_w = screen.right - screen.left;
+      const LONG screen_h = screen.bottom - screen.top;
+      const auto screen_center = MonitorFromPoint(
+        POINT { screen.left + screen_w / 2, screen.top + screen_h / 2 },
+        MONITOR_DEFAULTTONULL);
+
+      struct Ctx {
+        std::vector<HWND> *out;
+        RECT screen;
+        HMONITOR mon;
+      } ctx { &targets, screen, screen_center };
+
+      EnumWindows(
+        [](HWND hwnd, LPARAM param) -> BOOL {
+          auto *self = reinterpret_cast<Ctx *>(param);
+          if (IsIconic(hwnd)) {
+            return TRUE;
+          }
+          if ((::GetWindowLongPtrW(hwnd, GWL_EXSTYLE) & WS_EX_TOOLWINDOW) != 0) {
+            return TRUE;
+          }
+          if ((::GetWindowLongPtrW(hwnd, GWL_STYLE) & WS_CAPTION) == 0) {
+            return TRUE;
+          }
+          wchar_t title[256] {};
+          if (GetWindowTextW(hwnd, title, ARRAYSIZE(title)) == 0) {
+            return TRUE;
+          }
+          RECT r {};
+          if (GetWindowRect(hwnd, &r) == 0) {
+            return TRUE;
+          }
+          if (r.right - r.left < (self->screen.right - self->screen.left) / 4
+              || r.bottom - r.top < (self->screen.bottom - self->screen.top) / 4) {
+            return TRUE;
+          }
+          if (r.left == self->screen.left && r.top == self->screen.top
+              && r.right == self->screen.right && r.bottom == self->screen.bottom) {
+            return TRUE;
+          }
+          const POINT mid { (r.left + r.right) / 2, (r.top + r.bottom) / 2 };
+          if (MonitorFromPoint(mid, MONITOR_DEFAULTTONULL) != self->mon) {
+            return TRUE;
+          }
+          self->out->push_back(hwnd);
+          return TRUE;
+        },
+        reinterpret_cast<LPARAM>(&ctx));
+
+      if (targets.empty()) {
+        return 0;
+      }
+
+      for (const HWND hwnd : targets) {
+        SetWindowPos(hwnd, nullptr, screen.left, screen.top, screen_w, screen_h,
+                     SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED);
+      }
+
+      if (!lock) {
+        return static_cast<int>(targets.size());
+      }
+      // 返回实际锁上的数量：窗口可能在这一步被别人关掉，
+      // 让提示里的数字与真实状态一致。
+      return window_lock().engage(targets);
+    }
+
+    const option_t *
+    find_option(const std::string &key) {
+      for (const auto &opt : options()) {
+        if (opt.key == key) return &opt;
+      }
+      return nullptr;
+    }
+
+    /// The value we suggest for [key], or an empty optional when unknown.
+    boost::optional<std::string>
+    recommended_for(const std::string &key) {
+      const auto *opt = find_option(key);
+      if (opt == nullptr) return boost::none;
+      return opt->recommended;
+    }
+
+    // There is no preset table: each option carries its own recommended value.
+    // The virtual-display resolution list is not touched here at all -- the
+    // user drives that from the client, and rewriting vdd_settings.xml behind
+    // their back is what this card used to do (see the removed with_resolution
+    // / patch_vdd_modes helpers).
+
+    // config.cpp's to_bool() accepts "true"/"yes"/"enable"/"enabled"/"on"/"1"
+    // alike, so `capture_cursor = true` already satisfies a target of
+    // "enabled". Treat them as equal or the panel reports a永久 pending diff.
+    std::string
+    canonical_bool(const std::string &value) {
+      std::string lower;
+      lower.reserve(value.size());
+      for (char c : value) lower.push_back((char) std::tolower((unsigned char) c));
+
+      if (lower == "true" || lower == "yes" || lower == "enable" || lower == "enabled" || lower == "on" || lower == "1") return "enabled";
+      if (lower == "false" || lower == "no" || lower == "disable" || lower == "disabled" || lower == "off" || lower == "0") return "disabled";
+      return lower;
+    }
+
+    bool
+    value_matches(const std::string &target, const std::string &current) {
+      if (target == current) return true;
+      if (target == "enabled" || target == "disabled") return canonical_bool(current) == target;
+      return false;
+    }
+
+    // Rewrite only the `key = value` lines the preset touches, so every comment
+    // in sunshine.conf survives. config::update_config() rebuilds the file from
+    // the parsed map and would silently drop all of them.
+    bool
+    patch_conf(const std::map<std::string, std::string> &patch, std::vector<std::string> &changed) {
+      const auto content = file_handler::read_file(config::sunshine.config_file.c_str());
+
+      std::vector<std::string> lines;
+      {
+        std::istringstream in { content };
+        std::string line;
+        while (std::getline(in, line)) {
+          if (!line.empty() && line.back() == '\r') line.pop_back();
+          lines.push_back(line);
+        }
+      }
+
+      static const boost::regex kv { "^\\s*([A-Za-z_][A-Za-z0-9_]*)\\s*=\\s*(.*?)\\s*$" };
+      std::set<std::string> seen;
+
+      for (auto &line : lines) {
+        boost::smatch m;
+        if (!boost::regex_match(line, m, kv)) continue;
+
+        const std::string key = m[1].str();
+        const auto it = patch.find(key);
+        if (it == patch.end()) continue;
+
+        seen.insert(key);
+        const std::string before = m[2].str();
+        if (value_matches(it->second, before)) continue;
+
+        changed.push_back(key + ": " + before + " -> " + it->second);
+        line = key + " = " + it->second;
+      }
+
+      for (const auto &[key, value] : patch) {
+        if (seen.count(key)) continue;
+        changed.push_back(key + ": (新增) -> " + value);
+        lines.push_back(key + " = " + value);
+      }
+
+      if (changed.empty()) return true;
+
+      std::string out;
+      for (const auto &line : lines) out += line + "\n";
+      return file_handler::write_file(config::sunshine.config_file.c_str(), out) == 0;
+    }
+
+    // No VDD patching on purpose. This used to splice a 3840x2400 mode into
+    // ZakoVDD's <resolutions> behind the user's back, which fought with the
+    // resolution list they edit in the client. The client owns that now.
+
+    /// Validate one incoming value against the option's declared domain.
+    /// A bad value is rejected rather than written, so a crafted request
+    /// cannot push arbitrary strings into sunshine.conf.
+    bool
+    validate(const option_t &opt, const std::string &value, std::string &why) {
+      switch (opt.control) {
+        case control_t::toggle:
+          if (canonical_bool(value) != "enabled" && canonical_bool(value) != "disabled") {
+            why = "只能是 enabled / disabled";
+            return false;
+          }
+          return true;
+        case control_t::choice: {
+          const auto canonical = value == "enabled" || value == "disabled" ? canonical_bool(value) : value;
+          if (std::find(opt.choices.begin(), opt.choices.end(), canonical) == opt.choices.end()) {
+            why = "可选值：" + boost::algorithm::join(opt.choices, " / ");
+            return false;
+          }
+          return true;
+        }
+        case control_t::number: {
+          // Double, not integer: pen_pressure_gamma is a float and stoll()
+          // rejected every legal value for it ("0.7" -> "不是合法数字"),
+          // which made the most-wanted setting unsaveable.
+          try {
+            size_t used = 0;
+            const auto parsed = std::stod(value, &used);
+            if (used != value.size() || !std::isfinite(parsed)) {
+              why = "不是合法数字";
+              return false;
+            }
+            if (parsed < opt.min || parsed > opt.max) {
+              // Format without the trailing zeros std::to_string puts on doubles
+              // ("0.100000" reads like a bug in a validation message).
+              const auto trim = [](double v) {
+                auto s = std::to_string(v);
+                if (s.find('.') == std::string::npos) return s;
+                while (!s.empty() && s.back() == '0') s.pop_back();
+                if (!s.empty() && s.back() == '.') s.pop_back();
+                return s;
+              };
+              why = "超出范围 " + trim(opt.min) + " ~ " + trim(opt.max);
+              return false;
+            }
+          }
+          catch (const std::exception &) {
+            why = "不是合法数字";
+            return false;
+          }
+          return true;
+        }
+        case control_t::text:
+          if (value.empty() || value.size() > 64) {
+            why = "不能为空且不超过 64 字符";
+            return false;
+          }
+          return true;
+      }
+      why = "未知类型";
+      return false;
+    }
+
+    /// Read a key out of the live config, or an empty string when unset.
+    std::string
+    current_value(const std::optional<std::map<std::string, std::string>> &snapshot, const std::string &key) {
+      if (!snapshot) return {};
+      const auto it = snapshot->find(key);
+      return it == snapshot->end() ? std::string {} : it->second;
+    }
+  }  // namespace drawing_mode
+
+  void
+  getDrawingMode(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+    using namespace drawing_mode;
+
+    const auto snapshot = config::get_config_snapshot();
+
+    // Hand the UI the full list with current values, so it can render an
+    // editor. There is deliberately no "apply everything" any more: the user
+    // picks the rows they want and only those get written.
+    nlohmann::json items = nlohmann::json::array();
+    for (const auto &opt : options()) {
+      const auto current = current_value(snapshot, opt.key);
+
+      const char *control = "toggle";
+      switch (opt.control) {
+        case control_t::toggle: control = "toggle"; break;
+        case control_t::choice: control = "choice"; break;
+        case control_t::number: control = "number"; break;
+        case control_t::text: control = "text"; break;
+      }
+
+      nlohmann::json row {
+        { "key", opt.key },
+        { "control", control },
+        { "group", opt.group },
+        { "label", opt.label },
+        { "help", opt.help },
+        { "recommended", opt.recommended },
+        { "value", current },
+        { "is_default", current.empty() || value_matches(opt.recommended, current) },
+      };
+      if (opt.control == control_t::choice) {
+        row["choices"] = opt.choices;
+        // Parallel array; the UI pairs them by index and falls back to the raw
+        // value for any empty note.
+        nlohmann::json notes = nlohmann::json::array();
+        for (const auto *note : opt.choice_notes) notes.push_back(note ? note : "");
+        row["choice_notes"] = std::move(notes);
+      }
+      if (opt.control == control_t::number) {
+        row["lo"] = opt.min;
+        row["hi"] = opt.max;
+        // Ship the step instead of hardcoding 1 in the UI: a step of 1 makes
+        // the spinner jump straight past 0.7.
+        row["step"] = opt.step > 0.0 ? opt.step : 1.0;
+      }
+      items.push_back(std::move(row));
+    }
+
+    send_response(response, nlohmann::json {
+      { "status", true },
+      { "items", items },
+      { "restart_required", true },
+    });
+  }
+
+  void
+  applyDrawingMode(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+    using namespace drawing_mode;
+
+    // The request carries only the rows the user actually touched. Anything
+    // absent is left exactly as it is -- that is the whole point of dropping
+    // the preset.
+    nlohmann::json body;
+    try {
+      body = nlohmann::json::parse(request->content.string());
+    }
+    catch (const std::exception &) {
+      send_response(response, nlohmann::json { { "status", false }, { "message", "请求格式不对。" } });
+      return;
+    }
+    if (!body.is_object() || !body.contains("values") || !body["values"].is_object()) {
+      send_response(response, nlohmann::json { { "status", false }, { "message", "没有要写入的项。" } });
+      return;
+    }
+
+    std::map<std::string, std::string> patch;
+    nlohmann::json rejected = nlohmann::json::array();
+
+    for (const auto &[key, raw] : body["values"].items()) {
+      const auto *opt = find_option(key);
+      if (opt == nullptr) {
+        rejected.push_back({ { "key", key }, { "reason", "未知设置项" } });
+        continue;
+      }
+      if (!raw.is_string()) {
+        rejected.push_back({ { "key", key }, { "reason", "值必须是字符串" } });
+        continue;
+      }
+
+      auto value = raw.get<std::string>();
+      // Toggles are stored in the file as enabled/disabled, so normalise
+      // whatever the client sent (true/false/on/1) into that spelling.
+      if (opt->control == control_t::toggle) value = canonical_bool(value);
+
+      std::string why;
+      if (!validate(*opt, value, why)) {
+        rejected.push_back({ { "key", key }, { "reason", why } });
+        continue;
+      }
+      patch[key] = value;
+    }
+
+    if (!rejected.empty()) {
+      send_response(response, nlohmann::json {
+        { "status", false },
+        { "rejected", rejected },
+        { "message", "有几项没通过校验，什么都没写入。" },
+      });
+      return;
+    }
+
+    std::vector<std::string> changed;
+    if (!patch.empty() && !patch_conf(patch, changed)) {
+      send_response(response, nlohmann::json { { "status", false }, { "message", "写入 sunshine.conf 失败。" } });
+      return;
+    }
+
+    // drawing_fill_screen 是一件"现在就做"的事，不能混进"重启后生效"的提示里。
+    // patch_conf 照样把状态写进 conf 供前端回显，这里只把它从 changed 里摘掉。
+    const std::string fill_key { "drawing_fill_screen" };
+    std::string immediate_note;
+    if (const auto it = patch.find(fill_key); it != patch.end()) {
+      if (it->second == "enabled") {
+        const int n = fill_and_lock(true);
+        immediate_note = n > 0 ? "已铺满虚拟屏并锁定 " + std::to_string(n) + " 个窗口。"
+                               : (window_lock().active()
+                                    ? "窗口已经锁定，无需重复操作。"
+                                    : "虚拟屏上没找到可调整的窗口（软件可能没开在虚拟屏上）。");
+      } else {
+        const int n = window_lock().release_all();
+        immediate_note = n > 0 ? "已解锁并还原 " + std::to_string(n) + " 个窗口的大小和位置。"
+                               : "当前没有锁定的窗口。";
+      }
+      std::erase_if(changed, [&fill_key](const std::string &entry) {
+        return entry.starts_with(fill_key);
+      });
+    }
+
+    BOOST_LOG(info) << "SuperSun: drawing settings saved; "sv << changed.size() << " change(s)";
+    if (!immediate_note.empty()) {
+      BOOST_LOG(info) << "SuperSun: "sv << immediate_note;
+    }
+
+    std::string message;
+    if (!immediate_note.empty()) {
+      message = immediate_note;
+      if (!changed.empty()) {
+        message += " 另有 " + std::to_string(changed.size()) + " 项需要重启 Sunshine 后生效。";
+      }
+    } else {
+      message = changed.empty() ? "没有改动。" : "已保存 " + std::to_string(changed.size()) + " 项，重启 Sunshine 后生效。";
+    }
+
+    send_response(response, nlohmann::json {
+      { "status", true },
+      { "changed", changed },
+      { "restart_required", !changed.empty() },
+      { "message", message },
+    });
+  }
+
+  void
+  getUsbLink(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+    using namespace usb_link;
+
+    const auto snapshot = config::get_config_snapshot();
+    const auto read_int = [&snapshot](const char *key, int fallback) {
+      if (!snapshot) return fallback;
+      const auto it = snapshot->find(key);
+      if (it == snapshot->end() || it->second.empty()) return fallback;
+      try {
+        return std::stoi(it->second);
+      }
+      catch (const std::exception &) {
+        return fallback;
+      }
+    };
+
+    const auto max_bitrate = read_int("max_bitrate", kWifiMaxBitrateKbps);
+    const auto fec_percentage = read_int("fec_percentage", kWifiFecPercentage);
+
+    const auto link = detect();
+    const auto recommended = recommended_bitrate_kbps(link);
+
+    send_response(response, nlohmann::json {
+      { "status", true },
+      { "supported", true },
+      { "present", link.present },
+      { "adapter", link.adapter },
+      { "description", link.description },
+      { "ip", link.ip },
+      { "link_speed_mbps", link.speed_bps / 1000000ULL },
+      // False for RNDIS: the number is whatever the driver feels like reporting,
+      // so the UI must not present it as a measured throughput.
+      { "speed_reliable", link.speed_reliable },
+      { "recommended_bitrate", recommended },
+      { "presets", nlohmann::json::array({
+          { { "bitrate", kUsbConservativeKbps }, { "label", "conservative"sv } },
+          { { "bitrate", kUsbBalancedKbps }, { "label", "balanced"sv } },
+          { { "bitrate", kUsbAggressiveKbps }, { "label", "aggressive"sv } },
+        }) },
+      { "max_bitrate", max_bitrate },
+      { "fec_percentage", fec_percentage },
+      { "high_bandwidth", max_bitrate >= recommended && fec_percentage <= kUsbFecPercentage },
+      { "mode", link.present ? mode_from_description(link.description) : "" },
+      { "adb_found", !find_adb().empty() },
+      { "hint", link.hint },
+    });
+  }
+
+  void
+  switchUsbMode(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+    using namespace usb_link;
+
+    std::string mode = "ncm";
+    try {
+      const auto body = nlohmann::json::parse(request->content.string());
+      mode = body.value("mode", "ncm");
+    }
+    catch (const std::exception &) {
+      // empty body defaults to ncm
+    }
+
+    const auto result = switch_usb_mode(mode);
+
+    BOOST_LOG(info) << "SuperSun: USB tether switch to "sv << mode
+                    << (result.ok ? " succeeded"sv : " failed"sv);
+
+    send_response(response, nlohmann::json {
+      { "status", result.ok },
+      { "mode", mode },
+      { "output", result.output },
+      { "detail", result.detail },
+      { "need_relink", result.ok },
+      { "message", result.ok
+          ? ("已把平板 USB 切成 " + mode + "。USB 会重新枚举，链路会断一下；"
+             "重新配 IP 才能用：bash tools/usb_link/usb_link.py up --mode " + mode)
+          : ("切换失败：" + result.detail) },
+    });
+  }
+
+  void
+  applyUsbLink(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+    using namespace usb_link;
+
+    bool enable = true;
+    bool firewall = false;
+    int requested_bitrate = 0;
+    try {
+      const auto body = nlohmann::json::parse(request->content.string());
+      enable = body.value("enable", true);
+      firewall = body.value("firewall", false);
+      requested_bitrate = body.value("bitrate", 0);
+    }
+    catch (const std::exception &) {
+      // 空 body 视为「开」
+    }
+
+    if (requested_bitrate <= 0) requested_bitrate = recommended_bitrate_kbps(detect());
+    requested_bitrate = std::min(requested_bitrate, kAbsoluteMaxBitrateKbps);
+
+    std::vector<std::string> changed;
+    std::string firewall_error;
+
+    if (firewall) {
+      // Windows classifies a newly appeared adapter as an unidentified network,
+      // i.e. "public" profile, and inbound Sunshine traffic gets dropped. Only
+      // our own named rules are touched, so this is reversible from the UI.
+      if (!ensure_firewall_rules(enable, &firewall_error, changed) && enable) {
+        firewall_error = firewall_error.empty() ? "放行失败" : firewall_error;
+      }
+    }
+
+    std::map<std::string, std::string> patch;
+    build_bandwidth_patch(patch, enable, requested_bitrate);
+
+    if (!drawing_mode::patch_conf(patch, changed)) {
+      send_response(response, nlohmann::json { { "status", false }, { "message", "写入 sunshine.conf 失败。" } });
+      return;
+    }
+
+    BOOST_LOG(info) << "SuperSun: USB high-bandwidth link "sv
+                    << (enable ? "enabled"sv : "disabled"sv) << "; "sv
+                    << changed.size() << " change(s)";
+
+    send_response(response, nlohmann::json {
+      { "status", true },
+      { "enable", enable },
+      { "changed", changed },
+      { "firewall_applied", firewall },
+      { "firewall_error", firewall_error },
+      { "restart_required", true },
+      { "message", changed.empty() ? "已经是目标状态，无需改动。" : "已写入配置，重启 Sunshine 后生效。" },
     });
   }
 
@@ -4192,6 +5886,14 @@ namespace confighttp {
     server.resource["^/api/microphone/status$"]["GET"] = getMicrophoneStatus;
 #ifdef _WIN32
     server.resource["^/api/vdd/status$"]["GET"] = getVddStatus;
+    server.resource["^/api/wintab/status$"]["GET"] = getWintabStatus;
+    server.resource["^/api/wintab/install$"]["POST"] = installWintab;
+    server.resource["^/api/wintab/uninstall$"]["POST"] = uninstallWintab;
+    server.resource["^/api/presets/drawing$"]["GET"] = getDrawingMode;
+    server.resource["^/api/presets/drawing$"]["POST"] = applyDrawingMode;
+    server.resource["^/api/usb/link$"]["GET"] = getUsbLink;
+    server.resource["^/api/usb/link$"]["POST"] = applyUsbLink;
+    server.resource["^/api/usb/mode$"]["POST"] = switchUsbMode;
     server.resource["^/api/vulkan-hdr-bridge$"]["GET"] = getVulkanHdrBridgeStatus;
     server.resource["^/api/vulkan-hdr-bridge/validate$"]["POST"] = validateVulkanHdrBridge;
 #endif

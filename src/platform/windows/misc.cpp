@@ -1220,6 +1220,25 @@ namespace platf {
           start_dir.empty() ? NULL : start_dir.c_str(),
           (LPSTARTUPINFOW) &startup_info,
           &process_info);
+
+        // See the non-system branch: the job we are running in may forbid
+        // breakaway, in which case retry without the flag.
+        if (!ret && (creation_flags & CREATE_BREAKAWAY_FROM_JOB)) {
+          BOOST_LOG(debug) << "Retrying launch without CREATE_BREAKAWAY_FROM_JOB (CreateProcessAsUser error "sv
+                           << GetLastError() << ")"sv;
+          auto retry_flags = creation_flags & ~CREATE_BREAKAWAY_FROM_JOB;
+          ret = CreateProcessAsUserW(user_token,
+            NULL,
+            (LPWSTR) wcmd.c_str(),
+            NULL,
+            NULL,
+            !!(startup_info.StartupInfo.dwFlags & STARTF_USESTDHANDLES),
+            retry_flags,
+            env_block.data(),
+            start_dir.empty() ? NULL : start_dir.c_str(),
+            (LPSTARTUPINFOW) &startup_info,
+            &process_info);
+        }
       });
     }
     // Otherwise, launch the process using CreateProcessW()
@@ -1255,6 +1274,27 @@ namespace platf {
         start_dir.empty() ? NULL : start_dir.c_str(),
         (LPSTARTUPINFOW) &startup_info,
         &process_info);
+
+      // CREATE_BREAKAWAY_FROM_JOB fails with ERROR_ACCESS_DENIED when Sunshine
+      // is itself already inside a job object that forbids breakaway -- e.g.
+      // when it was started from a sandboxed terminal instead of Explorer.
+      // The flag is only an optimization (it keeps children out of our job),
+      // so drop it and retry rather than failing the launch outright.
+      if (!ret && (creation_flags & CREATE_BREAKAWAY_FROM_JOB)) {
+        BOOST_LOG(debug) << "Retrying launch without CREATE_BREAKAWAY_FROM_JOB (CreateProcess error "sv
+                         << GetLastError() << ")"sv;
+        auto retry_flags = creation_flags & ~CREATE_BREAKAWAY_FROM_JOB;
+        ret = CreateProcessW(NULL,
+          (LPWSTR) wcmd.c_str(),
+          NULL,
+          NULL,
+          !!(startup_info.StartupInfo.dwFlags & STARTF_USESTDHANDLES),
+          retry_flags,
+          env_block.data(),
+          start_dir.empty() ? NULL : start_dir.c_str(),
+          (LPSTARTUPINFOW) &startup_info,
+          &process_info);
+      }
     }
 
     // Use the results of the launch to create a bp::child object
@@ -1305,6 +1345,23 @@ namespace platf {
   void
   open_url(const std::string &url) {
     const std::string cmd_path = "assets/gui/sunshine-gui.exe";
+
+    // The dedicated GUI launcher is only shipped when the build fetched the
+    // control-panel bundle (CMake FETCH_GUI=ON). This tree builds with
+    // FETCH_GUI=OFF on purpose -- the download hits the anonymous GitHub API
+    // rate limit (403) -- so the file simply does not exist. Previously every
+    // tray "Open Sunshine" click then died with "Failed to launch process: 2"
+    // (ERROR_FILE_NOT_FOUND) plus "System: Invalid argument", and the Web UI
+    // looked completely broken even though the server was fine.
+    // Fall back to handing the URL to the system default browser instead.
+    std::error_code probe_ec;
+    if (!std::filesystem::exists(std::filesystem::path(cmd_path), probe_ec)) {
+      BOOST_LOG(debug) << "GUI launcher ["sv << cmd_path
+                       << "] not present; opening ["sv << url << "] in the default browser"sv;
+      open_url_in_browser(url);
+      return;
+    }
+
     const std::string cmd_args = "--url=" + url;
 
     boost::process::v1::environment _env = boost::this_process::environment();

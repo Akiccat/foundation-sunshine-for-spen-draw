@@ -41,7 +41,13 @@
       <height>2160</height>
       <refresh_rate>30</refresh_rate>
     </resolution>
-  </resolutions>
+          <!-- SuperSun drawing mode: 16:10 4K for supersampling the Tab S7+ panel -->
+        <resolution>
+            <width>3840</width>
+            <height>2400</height>
+            <refresh_rate>60</refresh_rate>
+        </resolution>
+</resolutions>
   <colour>
     <SDR10bit>false</SDR10bit>
     <HDRPlus>false</HDRPlus> <!-- If you have SDR10 bit enabled, HDRPlus wont work - there’s a conflict because the display system cannot simultaneously handle both high dynamic range 12-bit and standard dynamic range 10-bit settings. -->

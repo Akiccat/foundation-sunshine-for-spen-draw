@@ -51,6 +51,7 @@ extern "C" {
   #include "platform/windows/pyrowave/gpu_encoder.h"
   #include "platform/windows/pyrowave/color_metadata.h"
   #include "platform/windows/display.h"
+  #include "platform/windows/frame_keepalive.h"
 extern "C" {
   #include <libavutil/hwcontext_d3d11va.h>
 }
@@ -3516,19 +3517,15 @@ namespace video {
       BOOST_LOG(info) << "Minimum frame time set to "sv << base_minimum_frame_time.count() << "ms, based on client-requested target framerate "sv << config.framerate << "."sv;
     }
 
-    // 固定帧率出帧（fixed_frame_cadence）的目标间隔。
-    // 基准取「客户端请求的刷新率」，而不是 minimum_fps_target：后者没设置时
-    // 会退化成 2000/帧率 的等待时间（60fps 的流变成 33.3ms，正好是 30fps），
-    // 那正是本功能要修掉的现象，不能拿它当基准。
-    const auto fixed_cadence_interval = std::chrono::duration<double, std::milli> {
-      1000.0 / std::max(1.0, config.get_effective_framerate())
-    };
-    // 下一次编码应当开始的时刻。只有开启该功能时才维护。
-    std::optional<std::chrono::steady_clock::time_point> fixed_cadence_deadline;
+#ifdef _WIN32
+    // 帧率保活：开启后在每块显示器上放一个 1x1 微动像素，让桌面一直有新画面。
+    // 这样采集层会按客户端帧率持续出帧，编码循环自然跑满——不需要在编码侧
+    // 做栅格推算（那要跟采集层的 frame_pacing_group 抢节拍，很难做稳）。
+    // 幂等：真正创建窗口只在第一次调用时发生。
     if (config::video.fixed_frame_cadence) {
-      BOOST_LOG(info) << "Fixed frame cadence enabled: emitting every "sv << fixed_cadence_interval.count()
-                      << "ms ("sv << (1000.0 / fixed_cadence_interval.count()) << " fps) even when the screen is static."sv;
+      platf::frame_keepalive::start();
     }
+#endif
 
     const auto input_activity_boost_policy = make_input_activity_boost_policy({
       config::video.variable_refresh_rate,
@@ -3678,18 +3675,7 @@ namespace video {
       std::optional<platf::frame_pipeline_trace_t> pipeline_trace;
       bool has_new_frame = false;
 
-      // 固定帧率：等待预算改成「距下一个出帧栅格还剩多少」。
-      // 原先这里固定等满一个帧间隔，而画面静止时等不到新帧、这份等待会白费，
-      // 紧随其后的编码耗时再叠加上去，一帧的实际周期就成了「间隔 + 编码」，
-      // 于是 60fps 的流静止后掉到 30~45fps，延迟也跟着在 6~9ms 之间摆动。
-      // 按栅格出帧后周期恒等于目标间隔：有画面就发画面，没有就重发上一帧。
       auto wait_time = effective_frame_time;
-      if (config::video.fixed_frame_cadence && fixed_cadence_deadline) {
-        const auto now = std::chrono::steady_clock::now();
-        wait_time = *fixed_cadence_deadline > now
-                      ? std::chrono::duration<double, std::milli> { *fixed_cadence_deadline - now }
-                      : std::chrono::duration<double, std::milli> { 0 };
-      }
 
       // Encode at a minimum FPS to avoid image quality issues with static content
       // When variable_refresh_rate is enabled, only encode when we have a new frame
@@ -3735,21 +3721,12 @@ namespace video {
       // This allows the stream framerate to match the render framerate for VRR support
       // However, if minimum_fps_target is set, or input activity boost is active, we still encode
       // to maintain a temporary minimum FPS floor for better visual input feedback.
-      if (config::video.variable_refresh_rate && !config::video.fixed_frame_cadence && !has_new_frame && !requested_idr_frame) {
+      if (config::video.variable_refresh_rate && !has_new_frame && !requested_idr_frame) {
         // Only skip if minimum_fps_target is 0 (disabled) and input activity boost is inactive.
         if (config::video.minimum_fps_target == 0 && !input_boost_active) {
           continue;
         }
         // If minimum_fps_target is set or boost is active, we'll encode anyway to maintain minimum FPS.
-      }
-
-      // 固定帧率：把下一次编码安排在「本次编码开始」之后整整一个间隔。
-      // 用编码开始而不是结束作基准，编码耗时就被吸收进间隔里，静止时周期恰好
-      // 等于目标间隔；有画面时栅格会跟着画面到达时刻走，不会把已经到手的帧
-      // 压到下一拍才发出去（那等于平白加一帧延迟）。
-      if (config::video.fixed_frame_cadence) {
-        fixed_cadence_deadline = std::chrono::steady_clock::now() +
-                                 std::chrono::duration_cast<std::chrono::steady_clock::duration>(fixed_cadence_interval);
       }
 
       std::optional<encoder_rebuild_context_t> rebuild_context;
@@ -4087,15 +4064,6 @@ namespace video {
             ctx->idr_events->pop();
           }
 
-          // NOTE(fixed_frame_cadence): 这条同步循环**故意**不做固定帧率节流。
-          // 只有「不带 PARALLEL_ENCODING 的编码器」才会走到这里；而 Windows 上
-          // nvenc / quicksync / amdvce / software / vaapi / vulkan 全都带该标志，
-          // PyroWave 也在 capture() 里显式改走 capture_async —— 实际无人走此路径。
-          // 固定帧率是在 encode_run()（异步路径）里实现的，那里才有可控的循环内等待。
-          // 不要照搬过去：本循环每轮由采集回调驱动，真正的节奏由
-          // platform/windows/display_base.cpp 中「刻意采用 200ms 短超时轮询」的
-          // 采集代码决定（为规避 D3D11 独占锁饥饿），改它既会波及异步路径，
-          // 也违背上游的设计意图。
           std::optional<std::chrono::steady_clock::time_point> frame_timestamp;
           std::optional<platf::frame_pipeline_trace_t> pipeline_trace;
           if (img) {

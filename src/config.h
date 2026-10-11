@@ -122,7 +122,7 @@ namespace config {
     int hdr_prep;
     bool variable_refresh_rate;  // Allow video stream framerate to match render framerate for VRR support
     int minimum_fps_target;  // Minimum FPS target (0 = auto, 1-1000 = minimum FPS to maintain)
-    bool fixed_frame_cadence;  // Emit on a fixed frame-interval grid (repeat the last frame when the screen is static) instead of letting the wait timeout and the encode time add up
+    bool fixed_frame_cadence;  // 帧率保活：在每块显示器上放一个 1x1 微动像素，让桌面持续有新画面，编码循环于是能跑满客户端帧率。（键名沿用旧值，现有 conf 可直接生效）
     bool input_activity_boost;  // Temporarily raise encoding cadence after local input while VRR is active
     int input_activity_boost_fps;  // Minimum FPS floor to maintain during the input activity boost window
     int input_activity_boost_window_ms;  // Duration of the input activity boost window in milliseconds

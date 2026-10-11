@@ -502,7 +502,7 @@ namespace config {
     (int) display_device::parsed_config_t::hdr_prep_e::automatic,  // hdr_prep
     false,  // variable_refresh_rate
     0,  // minimum_fps_target (0 = auto, about half the stream FPS)
-    false,  // fixed_frame_cadence (default: off -- only an explicit opt-in keeps encoding on a fixed grid)
+    false,  // fixed_frame_cadence (帧率保活；默认关)
     true,  // input_activity_boost
     60,  // input_activity_boost_fps
     150,  // input_activity_boost_window_ms

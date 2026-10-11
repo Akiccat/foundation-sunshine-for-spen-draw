@@ -197,6 +197,8 @@ set(PLATFORM_TARGET_FILES
         "${CMAKE_SOURCE_DIR}/src/platform/windows/image_enhancement/dlss_nr/adapter_loader.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_cursor.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_cursor.cpp"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/frame_keepalive.h"
+        "${CMAKE_SOURCE_DIR}/src/platform/windows/frame_keepalive.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_vram_internal.h"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_vram_internal.cpp"
         "${CMAKE_SOURCE_DIR}/src/platform/windows/display_base.cpp"

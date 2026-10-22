@@ -4,7 +4,11 @@
  *
  * Windows clamps pen pressure injected through the pointer stack to 1024 steps.
  * Sunshine additionally publishes the raw pen state into shared memory, and our
- * own Wintab32.dll reads it there with a 4096 pressure axis. Because Windows
+ * own Wintab32.dll reads it there with a full-resolution pressure axis. The
+ * axis ceiling and the gain are both read per call, so the card can change them
+ * under a running app -- though whatever the app cached at startup is its own
+ * business, which is why the range notes say a restart is needed.
+ * Because Windows
  * resolves Wintab32.dll from the application directory before System32,
  * "installing" is just a file copy next to the drawing app's exe -- which also
  * means only that one app is affected and removing the file reverts everything.
@@ -28,6 +32,193 @@ const targets = ref([])
 const manualDir = ref('')
 
 const hasTargets = computed(() => targets.value.length > 0)
+// Kept as a computed rather than inline in the template: a bare "<" inside a
+// text interpolation is ambiguous to the HTML parser.
+const hasSavedGain = computed(() => storedUserMax.value > 0 && storedUserMax.value < 1)
+
+// The canvas only ever sees the wire's normalised 0..1, so a "level count" is
+// just that value multiplied by whatever range the user declared. This is why
+// a device whose real axis is 4096 still reads 100% with the field set to 8192:
+// reaching the top only means the hardware hit ITS OWN full scale, it says
+// nothing about whether the declared range is correct. Only the digitizer's
+// descriptor knows that, and it never crosses the wire.
+const deviceMaxSafe = computed(() => {
+  const n = Math.round(Number(deviceMax.value))
+  return Number.isFinite(n) && n > 0 ? n : 4096
+})
+const liveCount = computed(() => Math.round(live.value * deviceMaxSafe.value))
+const peakCount = computed(() => Math.round(peak.value * deviceMaxSafe.value))
+
+// Editing only the range must stay saveable: otherwise the user has to press
+// the canvas again just to write a number that was never measured here.
+const dirtyDevice = computed(() => deviceMaxSafe.value !== storedDeviceMax.value)
+const canSave = computed(() => !operating.value && (peak.value >= 0.05 || dirtyDevice.value))
+
+const gainHint = computed(() => {
+  if (dirtyDevice.value) return t('config.wintab_calib_dirty')
+  return hasSavedGain.value ? t('config.wintab_calib_saved_gain') : t('config.wintab_calib_not_saved')
+})
+
+// ---------------------------------------------------------------- calibration
+// deviceMax is the digitizer's real range: what the WinTab axis advertises.
+// userMax is the highest pressure THIS user can reach, used as a gain so a
+// light touch still reaches full brush size. Neither is guessed on the fly --
+// the wire only carries 0..1, so the level count has to be entered or reported.
+const deviceMax = ref(4096)
+const presetDeviceMax = ref(4096)
+const storedDeviceMax = ref(4096)
+const storedUserMax = ref(1.0)
+const limits = ref({ min: 256, max: 65536 })
+const calibrating = ref(false)
+const peak = ref(0)
+const live = ref(0)
+const samples = ref(0)
+const usedPen = ref(false)
+const canvasRef = ref(null)
+let drawing = false
+
+async function loadPressure() {
+  try {
+    const data = await apiJson('/api/wintab/pressure')
+    if (data?.status === false) return
+    deviceMax.value = data?.device_max ?? deviceMax.value
+    storedDeviceMax.value = data?.device_max ?? storedDeviceMax.value
+    presetDeviceMax.value = data?.default_device_max ?? presetDeviceMax.value
+    storedUserMax.value = data?.user_max ?? 1.0
+    if (data?.limits) limits.value = data.limits
+    peak.value = storedUserMax.value < 1 ? storedUserMax.value : 0
+    redraw()
+  } catch {
+    /* the card still works offline; the POST will surface the error */
+  }
+}
+
+function toggleCalibration() {
+  calibrating.value = !calibrating.value
+  if (calibrating.value) {
+    peak.value = 0
+    live.value = 0
+    samples.value = 0
+    usedPen.value = false
+  }
+  redraw()
+}
+
+function pressureFrom(e) {
+  // Chrome reports 0.5 for a mouse button press and for pens without pressure
+  // support. That is not a measurement, so it is flagged in the UI instead of
+  // being silently folded into the peak.
+  if (e.pointerType === 'pen') usedPen.value = true
+  const p = Number(e.pressure)
+  return Number.isFinite(p) ? Math.max(0, Math.min(1, p)) : 0
+}
+
+function sample(e) {
+  const p = pressureFrom(e)
+  live.value = p
+  if (p > peak.value) peak.value = p
+  samples.value += 1
+  redraw()
+}
+
+function onPointerDown(e) {
+  if (!calibrating.value) return
+  e.preventDefault()
+  drawing = true
+  try { e.target.setPointerCapture(e.pointerId) } catch { /* not fatal */ }
+  sample(e)
+}
+
+function onPointerMove(e) {
+  if (!drawing || !calibrating.value) return
+  e.preventDefault()
+  sample(e)
+}
+
+function onPointerUp() {
+  drawing = false
+}
+
+function redraw() {
+  const c = canvasRef.value
+  if (!c) return
+  const dpr = window.devicePixelRatio || 1
+  const w = c.clientWidth || 480
+  const h = c.clientHeight || 110
+  const pw = Math.round(w * dpr)
+  const ph = Math.round(h * dpr)
+  if (c.width !== pw || c.height !== ph) {
+    c.width = pw
+    c.height = ph
+  }
+  const g = c.getContext('2d')
+  if (!g) return
+  g.setTransform(dpr, 0, 0, dpr, 0, 0)
+  g.fillStyle = '#f1f3f5'
+  g.fillRect(0, 0, w, h)
+
+  // Live pressure as a growing bar from the bottom.
+  g.fillStyle = '#3b82f6'
+  g.fillRect(0, h - h * live.value, w, h * live.value)
+
+  // Peak as a marker the user is trying to push to the right edge.
+  if (peak.value > 0) {
+    const x = Math.min(w - 2, w * peak.value)
+    g.strokeStyle = '#f59e0b'
+    g.lineWidth = 2
+    g.beginPath()
+    g.moveTo(x, 0)
+    g.lineTo(x, h)
+    g.stroke()
+  }
+
+  g.fillStyle = '#495057'
+  g.font = '600 13px system-ui, sans-serif'
+  g.fillText(`${liveCount.value} / ${deviceMaxSafe.value}`, 8, 18)
+  if (peak.value > 0) {
+    g.font = '12px system-ui, sans-serif'
+    g.fillText(`${t('config.wintab_calib_peak')} ${peakCount.value} / ${deviceMaxSafe.value}  (${(peak.value * 100).toFixed(1)}%)`, 8, 36)
+  }
+}
+
+async function postPressure(payload) {
+  operating.value = true
+  message.value = ''
+  isError.value = false
+  try {
+    const data = await apiPostJson('/api/wintab/pressure', payload)
+    message.value = data?.message || t('config.wintab_done')
+    isError.value = data?.status === false
+    await loadPressure()
+  } catch (e) {
+    isError.value = true
+    message.value = e instanceof Error ? e.message : String(e)
+  } finally {
+    operating.value = false
+  }
+}
+
+async function savePressure() {
+  // A peak below 5% is almost certainly "the user never actually pressed", so
+  // refuse rather than writing a gain that would saturate the pen instantly.
+  // The exception is a range-only edit: keep whatever gain is already stored.
+  const measured = peak.value >= 0.05
+  if (!measured && !dirtyDevice.value) {
+    isError.value = true
+    message.value = t('config.wintab_calib_too_low')
+    return
+  }
+  await postPressure({
+    device_max: deviceMaxSafe.value,
+    user_max: measured ? Number(peak.value.toFixed(4)) : storedUserMax.value,
+  })
+}
+
+async function clearCalibration() {
+  peak.value = 0
+  live.value = 0
+  await postPressure({ device_max: deviceMaxSafe.value, user_max: 1.0 })
+}
 
 async function refresh() {
   loading.value = true
@@ -79,7 +270,10 @@ async function runOp(dir, install) {
   }
 }
 
-onMounted(refresh)
+onMounted(() => {
+  refresh()
+  loadPressure()
+})
 </script>
 
 <template>
@@ -154,6 +348,94 @@ onMounted(refresh)
             </div>
           </template>
 
+          <hr>
+
+          <div class="wintab-calib">
+            <div class="wintab-calib-title">{{ $t('config.wintab_calib_section') }}</div>
+            <div class="form-text mb-2">{{ $t('config.wintab_calib_desc') }}</div>
+
+            <div class="row g-2 align-items-start mb-2">
+              <div class="col-sm-6">
+                <label for="wintab_device_max" class="form-label">
+                  {{ $t('config.wintab_calib_device_max') }}
+                </label>
+                <input id="wintab_device_max" type="number" class="form-control"
+                       :min="limits.min" :max="limits.max" step="1" v-model.number="deviceMax">
+                <div class="form-text">
+                  {{ $t('config.wintab_calib_device_max_hint') }}
+                  <span class="wintab-calib-link" @click="deviceMax = presetDeviceMax">
+                    ({{ presetDeviceMax }})
+                  </span>
+                </div>
+                <div class="form-text wintab-calib-note">
+                  <i class="fas fa-arrows-rotate me-1"></i>
+                  <span>{{ $t('config.wintab_calib_device_max_restart') }}</span>
+                </div>
+                <div class="form-text wintab-calib-note">
+                  <i class="fas fa-circle-info me-1"></i>
+                  <span>{{ $t('config.wintab_calib_device_max_note') }}</span>
+                </div>
+                <div v-if="deviceMaxSafe !== presetDeviceMax" class="form-text wintab-calib-warn">
+                  <i class="fas fa-triangle-exclamation me-1"></i>
+                  <span>{{ $t('config.wintab_calib_device_max_custom', { preset: presetDeviceMax }) }}</span>
+                </div>
+              </div>
+              <div class="col-sm-6">
+                <div class="form-label">{{ $t('config.wintab_calib_user_max') }}</div>
+                <div class="wintab-calib-readout">
+                  <span class="wintab-calib-live">
+                    {{ $t('config.wintab_calib_live') }} {{ liveCount }} / {{ deviceMaxSafe }}
+                  </span>
+                  <span class="wintab-calib-samples">
+                    {{ samples }} {{ $t('config.wintab_calib_samples') }}
+                  </span>
+                </div>
+                <div class="wintab-calib-readout">
+                  <span class="wintab-calib-peak">
+                    {{ $t('config.wintab_calib_peak') }} {{ peakCount }} / {{ deviceMaxSafe }}
+                  </span>
+                  <span class="wintab-calib-pct">{{ (peak * 100).toFixed(1) }}%</span>
+                </div>
+                <div class="form-text">
+                  {{ gainHint }}
+                </div>
+                <div class="form-text wintab-calib-note">
+                  <i class="fas fa-bolt me-1"></i>
+                  <span>{{ $t('config.wintab_calib_user_max_live') }}</span>
+                </div>
+              </div>
+            </div>
+
+            <canvas ref="canvasRef" class="wintab-canvas"
+                    @pointerdown="onPointerDown" @pointermove="onPointerMove"
+                    @pointerup="onPointerUp" @pointercancel="onPointerUp"
+                    @pointerleave="onPointerUp"></canvas>
+
+            <div class="form-text mb-2">
+              {{ calibrating ? $t('config.wintab_calib_press_hint') : $t('config.wintab_calib_idle_hint') }}
+              <span v-if="calibrating && !usedPen" class="wintab-calib-warn">
+                {{ $t('config.wintab_calib_not_pen') }}
+              </span>
+            </div>
+
+            <div class="vmouse-panel-body px-0">
+              <button class="vmouse-action-btn vmouse-install-btn" @click="toggleCalibration">
+                <i class="fas" :class="calibrating ? 'fa-stop' : 'fa-pen'"></i>
+                <span>{{ calibrating ? $t('config.wintab_calib_stop') : $t('config.wintab_calib_start') }}</span>
+              </button>
+              <button class="vmouse-action-btn vmouse-install-btn" @click="savePressure"
+                      :disabled="!canSave">
+                <span v-if="operating" class="vmouse-spinner"></span>
+                <i v-else class="fas fa-save"></i>
+                <span>{{ $t('config.wintab_calib_apply') }}</span>
+              </button>
+              <button class="vmouse-action-btn vmouse-uninstall-btn" @click="clearCalibration" :disabled="operating">
+                <i class="fas fa-undo"></i>
+                <span>{{ $t('config.wintab_calib_clear') }}</span>
+              </button>
+            </div>
+          </div>
+
           <div v-if="message" class="vmouse-helper mt-2" :class="{ 'wintab-error': isError }">
             <i class="fas" :class="isError ? 'fa-exclamation-triangle' : 'fa-check-circle'" ></i>
             <span class="ms-1">{{ message }}</span>
@@ -177,5 +459,63 @@ onMounted(refresh)
   background: var(--ui-danger-soft);
   border-color: var(--ui-danger-border);
   color: var(--ui-danger-text);
+}
+
+.wintab-calib-title {
+  font-weight: 600;
+  margin-bottom: 0.25rem;
+}
+
+/* touch-action: none is load-bearing. Without it the browser treats a pen drag
+   as a scroll gesture and never delivers pointermove, so the canvas would only
+   ever see the initial press. */
+.wintab-canvas {
+  display: block;
+  width: 100%;
+  height: 110px;
+  border: 1px solid var(--ui-border, #dee2e6);
+  border-radius: 0.375rem;
+  touch-action: none;
+  cursor: crosshair;
+  user-select: none;
+}
+
+.wintab-calib-readout {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: 0.5rem;
+  font-family: var(--ui-font-mono, monospace);
+  font-size: 0.95rem;
+  line-height: 1.3;
+}
+
+.wintab-calib-peak {
+  font-weight: 600;
+}
+
+.wintab-calib-pct {
+  font-size: 0.78rem;
+  color: var(--ui-text-muted);
+}
+
+.wintab-calib-samples {
+  font-size: 0.72rem;
+  color: var(--ui-text-muted);
+}
+
+.wintab-calib-note {
+  margin-top: 0.25rem;
+  color: var(--ui-text-muted);
+}
+
+.wintab-calib-link {
+  cursor: pointer;
+  text-decoration: underline;
+}
+
+.wintab-calib-warn {
+  display: block;
+  color: #b45309;
 }
 </style>

@@ -237,6 +237,14 @@ namespace config {
     float pen_pressure_gamma = 0.7f;
     /** Pressure band reported while the pen hovers, 0..64. 0 = hovering never draws. */
     int pen_hover_pressure = 0;
+
+    /** WinTab axis maximum advertised by our Wintab32.dll. Should match the
+     *  digitizer's real range (S Pen: 4096). 0 = derive nothing, use the DLL
+     *  default. Set by the web UI's pen-pressure calibration. */
+    int pen_pressure_device_max = 4096;
+    /** Highest pressure the user can actually reach, 0..1, from the same
+     *  calibration. 1.0 (or 0) disables the gain. */
+    float pen_pressure_user_max = 1.0f;
   };
 
   namespace flag {

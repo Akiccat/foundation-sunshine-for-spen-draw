@@ -36,7 +36,7 @@
 #include <stdint.h>
 
 #define SUPERWINTAB_MAGIC 0x5350454Eu /* "SPEN" */
-#define SUPERWINTAB_VERSION 1u
+#define SUPERWINTAB_VERSION 2u
 
 /* Session-local so it cannot collide across user sessions. */
 #define SUPERWINTAB_MAP_NAME "Local\\SuperSunPenState"
@@ -52,8 +52,19 @@
 
 /* Pressure range advertised over WinTab. 4096 matches the S Pen's real
  * ABS_PRESSURE range, which is what the Android side reports natively. The
- * Ink path could only ever expose 1024 of these. */
+ * Ink path could only ever expose 1024 of these.
+ *
+ * This is now only a FALLBACK: Sunshine fills pressure_max from the value the
+ * client reports for its digitizer (see the calibration card in the web UI), so
+ * a pen with a different hardware range gets a matching axis instead of being
+ * rescaled onto a 4096 grid that does not exist. */
 #define SUPERWINTAB_PRESSURE_MAX 4096
+
+/* Accepted bounds for the negotiated axis maximum. Below 256 the drawing app
+ * would visibly stair-step; above 65536 nothing on the Android side can fill
+ * it anyway. */
+#define SUPERWINTAB_PRESSURE_MIN 256u
+#define SUPERWINTAB_PRESSURE_MAX_LIMIT 65536u
 
 typedef struct superwintab_state {
   uint32_t magic;
@@ -85,6 +96,23 @@ typedef struct superwintab_state {
    * coordinates without guessing. */
   volatile uint32_t screen_w;
   volatile uint32_t screen_h;
+
+  /* ---------------------------------------------------------------- v2 --
+   * Pressure calibration. Written by Sunshine, read by the DLL.
+   *
+   * pressure_max is the WinTab axis maximum the DLL advertises. It should match
+   * the digitizer's real range (the S Pen's ABS_PRESSURE tops out at 4095, so
+   * 4096). The web UI's calibration card sets it from the device report instead
+   * of trusting a compiled-in constant; 0 means "fall back to
+   * SUPERWINTAB_PRESSURE_MAX".
+   */
+  volatile uint32_t pressure_max;
+
+  /* The highest pressure the *user* can physically reach, 0..1, captured by
+   * pressing as hard as possible on the calibration canvas. Dividing by this
+   * maps "as hard as I can press" onto the full axis, which is what a user with
+   * a light touch actually wants. <= 0 or >= 1 means no rescaling. */
+  volatile float pressure_user_max;
 } superwintab_state_t;
 
 #endif /* SUPERWINTAB_STATE_H */

@@ -18,6 +18,7 @@
 
 #include "dsu_server.h"
 #include "superwintab_state.h"
+#include "superwintab_publish.h"
 #include "ds5/ds5_sidecar_client.h"
 #include "src/ds5/config.h"
 #include "keylayout.h"
@@ -1427,33 +1428,46 @@ namespace platf {
   superwintab_state_t *g_sw_state = nullptr;
   CRITICAL_SECTION g_sw_lock;
 
+  superwintab_state_t *
+  superwintab_ensure_map() {
+    if (g_sw_state) return g_sw_state;
+
+    g_sw_map = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
+                                  SUPERWINTAB_MAP_SIZE, SUPERWINTAB_MAP_NAME);
+    if (!g_sw_map) {
+      BOOST_LOG(warning) << "SuperSun: 无法创建 Wintab 压感通道 (err="sv << GetLastError() << ")"sv;
+      return nullptr;
+    }
+
+    void *view = MapViewOfFile(g_sw_map, FILE_MAP_WRITE, 0, 0, SUPERWINTAB_MAP_SIZE);
+    if (!view) {
+      BOOST_LOG(warning) << "SuperSun: 无法映射 Wintab 压感通道 (err="sv << GetLastError() << ")"sv;
+      CloseHandle(g_sw_map);
+      g_sw_map = nullptr;
+      return nullptr;
+    }
+
+    InitializeCriticalSection(&g_sw_lock);
+    g_sw_state = (superwintab_state_t *) view;
+    g_sw_state->magic = SUPERWINTAB_MAGIC;
+    g_sw_state->version = SUPERWINTAB_VERSION;
+    g_sw_state->seq = 0;
+    g_sw_state->sample_id = 0;
+
+    // Seed the calibration from the config so a Sunshine restart keeps whatever
+    // the calibration card saved, even before the first pen sample arrives.
+    g_sw_state->pressure_max = (std::uint32_t) std::clamp(config::input.pen_pressure_device_max, 256, 65536);
+    g_sw_state->pressure_user_max = config::input.pen_pressure_user_max;
+
+    BOOST_LOG(info) << "SuperSun: Wintab 压感通道就绪 ["sv << SUPERWINTAB_MAP_NAME
+                    << "]，量程 0.."sv << g_sw_state->pressure_max
+                    << "，用户校准最大值 "sv << g_sw_state->pressure_user_max;
+    return g_sw_state;
+  }
+
   void
   superwintab_publish(const pen_input_t &pen, const touch_port_t &touch_port, const POINTER_PEN_INFO &penInfo) {
-    if (!g_sw_state) {
-      g_sw_map = CreateFileMappingA(INVALID_HANDLE_VALUE, nullptr, PAGE_READWRITE, 0,
-                                    SUPERWINTAB_MAP_SIZE, SUPERWINTAB_MAP_NAME);
-      if (!g_sw_map) {
-        BOOST_LOG(warning) << "SuperSun: 无法创建 Wintab 压感通道 (err="sv << GetLastError() << ")"sv;
-        return;
-      }
-
-      void *view = MapViewOfFile(g_sw_map, FILE_MAP_WRITE, 0, 0, SUPERWINTAB_MAP_SIZE);
-      if (!view) {
-        BOOST_LOG(warning) << "SuperSun: 无法映射 Wintab 压感通道 (err="sv << GetLastError() << ")"sv;
-        CloseHandle(g_sw_map);
-        g_sw_map = nullptr;
-        return;
-      }
-
-      InitializeCriticalSection(&g_sw_lock);
-      g_sw_state = (superwintab_state_t *) view;
-      g_sw_state->magic = SUPERWINTAB_MAGIC;
-      g_sw_state->version = SUPERWINTAB_VERSION;
-      g_sw_state->seq = 0;
-      g_sw_state->sample_id = 0;
-      BOOST_LOG(info) << "SuperSun: Wintab 压感通道就绪 ["sv << SUPERWINTAB_MAP_NAME
-                      << "]，量程 0.."sv << SUPERWINTAB_PRESSURE_MAX;
-    }
+    if (!superwintab_ensure_map()) return;
 
     EnterCriticalSection(&g_sw_lock);
 
@@ -1496,6 +1510,44 @@ namespace platf {
     s->seq = busy + 1;
 
     LeaveCriticalSection(&g_sw_lock);
+  }
+
+  void
+  superwintab_set_pressure_scaling(std::uint32_t device_max, float user_max) {
+    auto *s = superwintab_ensure_map();
+    if (!s) {
+      BOOST_LOG(warning) << "SuperSun: 压感校准写入失败——通道尚未建立"sv;
+      return;
+    }
+
+    EnterCriticalSection(&g_sw_lock);
+
+    // Same seqlock discipline as the sample path: a reader must never observe a
+    // half-updated pair (new axis with the old gain would rescale existing
+    // strokes by the wrong factor).
+    const std::uint32_t busy = s->seq + 1;
+    s->seq = busy;
+
+    if (device_max) {
+      s->pressure_max = (std::uint32_t) std::clamp<int>(device_max, 256, 65536);
+    }
+    s->pressure_user_max = std::clamp(user_max, 0.0f, 1.0f);
+
+    s->seq = busy + 1;
+
+    LeaveCriticalSection(&g_sw_lock);
+
+    BOOST_LOG(info) << "SuperSun: 压感校准已更新 —— 量程 0.."sv << s->pressure_max
+                    << "，用户可达最大值 "sv << s->pressure_user_max;
+  }
+
+  bool
+  superwintab_get_pressure_scaling(std::uint32_t &device_max, float &user_max) {
+    auto *s = superwintab_ensure_map();
+    if (!s) return false;
+    device_max = s->pressure_max;
+    user_max = s->pressure_user_max;
+    return true;
   }
 
   constexpr ULONG HIMETRIC_PER_MM = 100;

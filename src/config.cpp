@@ -1612,6 +1612,37 @@ namespace config {
     }
     int_between_f(vars, "pen_hover_pressure", input.pen_hover_pressure, { 0, 64 });
 
+    // Pen pressure calibration, written by the web UI card. The device max is
+    // the digitizer's real range (what the WinTab axis advertises); the user max
+    // is how hard this particular person can press, used as a gain so a light
+    // touch still reaches full brush size.
+    {
+      auto it = vars.find("pen_pressure_device_max");
+      if (it != vars.end()) {
+        char *end = nullptr;
+        const long parsed = std::strtol(it->second.c_str(), &end, 10);
+        if (end != it->second.c_str() && parsed >= 256 && parsed <= 65536) {
+          input.pen_pressure_device_max = static_cast<int>(parsed);
+        }
+        else {
+          BOOST_LOG(warning) << "Ignoring invalid pen_pressure_device_max: ["sv << it->second << "]";
+        }
+      }
+    }
+    {
+      auto it = vars.find("pen_pressure_user_max");
+      if (it != vars.end()) {
+        char *end = nullptr;
+        const float parsed = std::strtof(it->second.c_str(), &end);
+        if (end != it->second.c_str() && std::isfinite(parsed) && parsed > 0.0f && parsed <= 1.0f) {
+          input.pen_pressure_user_max = parsed;
+        }
+        else {
+          BOOST_LOG(warning) << "Ignoring invalid pen_pressure_user_max: ["sv << it->second << "]";
+        }
+      }
+    }
+
     bool_f(vars, "notify_pre_releases", sunshine.notify_pre_releases);
 
     bool_f(vars, "system_tray", sunshine.system_tray);

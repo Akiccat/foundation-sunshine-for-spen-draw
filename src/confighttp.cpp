@@ -87,6 +87,10 @@
 #include "widget_http.h"
 #include "webhook/webhook_api.h"
 
+// Plain C, no platform headers: safe to include on every target. The endpoints
+// that use it are Windows-only, but the limits they validate against are not.
+#include "platform/windows/superwintab_state.h"
+
 #ifdef _WIN32
   #include "ds5/config_api.h"
   #include <iphlpapi.h>
@@ -96,6 +100,7 @@
   #include "display_device/vdd_utils.h"
   #include "platform/windows/display_device/color_profile.h"
   #include "platform/windows/mic_write.h"
+  #include "platform/windows/superwintab_publish.h"
   #include "platform/windows/vulkan_hdr_bridge_session.h"
 #endif
 
@@ -3406,6 +3411,132 @@ namespace confighttp {
     }
   }  // namespace drawing_mode
 
+  // --------------------------------------------------------------------------
+  // Pen pressure calibration
+  //
+  // Two numbers come out of the calibration card:
+  //   device_max -- the digitizer's real pressure range. Advertised to drawing
+  //                 apps as the WinTab axis maximum, so an 8192-level pen is
+  //                 not squeezed onto a 4096 grid (and vice versa).
+  //   user_max   -- how hard this particular person can press, 0..1. Used as a
+  //                 gain so a light touch still reaches full brush size.
+  //
+  // Both live in sunshine.conf and are pushed into the shared-memory channel
+  // immediately, so a running drawing app picks them up without a restart.
+  // --------------------------------------------------------------------------
+
+  void
+  getPenPressure(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+    std::uint32_t live_device = 0;
+    float live_user = 1.0f;
+    bool published = false;
+#ifdef _WIN32
+    published = platf::superwintab_get_pressure_scaling(live_device, live_user);
+#endif
+
+    send_response(response, nlohmann::json {
+      { "status", true },
+      { "device_max", config::input.pen_pressure_device_max },
+      { "user_max", config::input.pen_pressure_user_max },
+      { "published", published },
+      { "live_device_max", published ? live_device : 0 },
+      { "live_user_max", published ? live_user : 0.0f },
+      { "default_device_max", SUPERWINTAB_PRESSURE_MAX },
+      { "limits", { { "min", SUPERWINTAB_PRESSURE_MIN }, { "max", SUPERWINTAB_PRESSURE_MAX_LIMIT } } },
+    });
+  }
+
+  void
+  setPenPressure(resp_https_t response, req_https_t request) {
+    if (!authenticate(response, request)) return;
+
+    nlohmann::json body;
+    try {
+      body = nlohmann::json::parse(request->content.string());
+    }
+    catch (const std::exception &) {
+      send_response(response, nlohmann::json { { "status", false }, { "message", "请求格式不对。" } });
+      return;
+    }
+    if (!body.is_object()) {
+      send_response(response, nlohmann::json { { "status", false }, { "message", "请求格式不对。" } });
+      return;
+    }
+
+    // Absent fields keep their current value: the card sends only what the user
+    // actually changed.
+    int device_max = config::input.pen_pressure_device_max;
+    if (body.contains("device_max")) {
+      if (!body["device_max"].is_number_integer()) {
+        send_response(response, nlohmann::json { { "status", false }, { "message", "device_max 必须是整数。" } });
+        return;
+      }
+      device_max = body["device_max"].get<int>();
+      if (device_max < (int) SUPERWINTAB_PRESSURE_MIN || device_max > (int) SUPERWINTAB_PRESSURE_MAX_LIMIT) {
+        send_response(response, nlohmann::json {
+          { "status", false },
+          { "message", "device_max 必须在 256 .. 65536 之间。" },
+        });
+        return;
+      }
+    }
+
+    float user_max = config::input.pen_pressure_user_max;
+    if (body.contains("user_max")) {
+      if (!body["user_max"].is_number()) {
+        send_response(response, nlohmann::json { { "status", false }, { "message", "user_max 必须是数字。" } });
+        return;
+      }
+      user_max = body["user_max"].get<float>();
+      // 0 means "clear the calibration" -> store 1.0, which the DLL treats as a
+      // no-op gain. Anything else has to be a plausible fraction.
+      if (user_max <= 0.0f) user_max = 1.0f;
+      if (user_max > 1.0f) {
+        send_response(response, nlohmann::json { { "status", false }, { "message", "user_max 必须在 0 .. 1 之间。" } });
+        return;
+      }
+    }
+
+    // Persist first: if the file write fails we must not leave the live channel
+    // disagreeing with what a restart would load.
+    // std::to_string(float) pads to six decimals; trim so sunshine.conf reads
+    // "0.82" instead of "0.820000".
+    auto trim_float = [](float v) {
+      std::string s = std::to_string(v);
+      s.erase(s.find_last_not_of('0') + 1);
+      if (!s.empty() && s.back() == '.') s.pop_back();
+      return s;
+    };
+
+    std::map<std::string, std::string> patch {
+      { "pen_pressure_device_max", std::to_string(device_max) },
+      { "pen_pressure_user_max", trim_float(user_max) },
+    };
+
+    std::vector<std::string> changed;
+    if (!drawing_mode::patch_conf(patch, changed)) {
+      send_response(response, nlohmann::json { { "status", false }, { "message", "写入 sunshine.conf 失败。" } });
+      return;
+    }
+
+    config::input.pen_pressure_device_max = device_max;
+    config::input.pen_pressure_user_max = user_max;
+
+#ifdef _WIN32
+    platf::superwintab_set_pressure_scaling((std::uint32_t) device_max, user_max);
+#endif
+
+    send_response(response, nlohmann::json {
+      { "status", true },
+      { "device_max", device_max },
+      { "user_max", user_max },
+      { "changed", changed },
+      { "message", "已保存。" },
+    });
+  }
+
   void
   getDrawingMode(resp_https_t response, req_https_t request) {
     if (!authenticate(response, request)) return;
@@ -5890,6 +6021,8 @@ namespace confighttp {
     server.resource["^/api/wintab/status$"]["GET"] = getWintabStatus;
     server.resource["^/api/wintab/install$"]["POST"] = installWintab;
     server.resource["^/api/wintab/uninstall$"]["POST"] = uninstallWintab;
+    server.resource["^/api/wintab/pressure$"]["GET"] = getPenPressure;
+    server.resource["^/api/wintab/pressure$"]["POST"] = setPenPressure;
     server.resource["^/api/presets/drawing$"]["GET"] = getDrawingMode;
     server.resource["^/api/presets/drawing$"]["POST"] = applyDrawingMode;
     server.resource["^/api/usb/link$"]["GET"] = getUsbLink;
